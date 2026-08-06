@@ -30,7 +30,7 @@ from metadata import (
     get_label,
     load_parquet_with_labels,
 )
-from crosstab_engine import build_banner, format_banner_table, get_column_series, small_n_mask
+from crosstab_engine import build_banner, format_banner_table_full, get_column_series, small_n_mask_full
 
 st.set_page_config(page_title="Gerador de Banner", layout="wide")
 
@@ -149,8 +149,8 @@ def main() -> None:
         )
         st.stop()
 
-    table = format_banner_table(blocks)
-    mask = small_n_mask(blocks)
+    table = format_banner_table_full(blocks)
+    mask = small_n_mask_full(blocks)
 
     for b in blocks:
         if b.coverage_warning:
@@ -166,9 +166,21 @@ def main() -> None:
             )
         return styles
 
-    styled = table.style.apply(_highlight_small_n, axis=None).format("{:.1f}")
+    # linha "NA" mostra contagem inteira; %LINHA/%COLUNA mostram 1 casa decimal
+    na_rows = table.index[table.index.get_level_values(1) == "NA"]
+    pct_rows = table.index[table.index.get_level_values(1) != "NA"]
+    styled = (
+        table.style
+        .apply(_highlight_small_n, axis=None)
+        .format("{:,.0f}", subset=pd.IndexSlice[na_rows, :])
+        .format("{:.1f}", subset=pd.IndexSlice[pct_rows, :])
+    )
     st.dataframe(styled, use_container_width=True)
-    st.caption("Células em amarelo: base abaixo do limiar definido — leia o percentual com cautela.")
+    st.caption(
+        "NA = contagem não ponderada · %LINHA = % dentro da categoria do stub · "
+        "%COLUNA = % dentro da categoria do banner. Células em amarelo: base "
+        "abaixo do limiar definido — leia o percentual com cautela."
+    )
 
     st.subheader("Gráfico")
     chart_banner_label = get_label(meta, banner_keys[0])

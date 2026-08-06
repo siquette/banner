@@ -65,6 +65,22 @@ def get_column_series(data: pd.DataFrame, name: str) -> pd.Series:
     return _get_series(data, name)
 
 
+def _mr_selected_mask(col: pd.Series) -> pd.Series:
+    """
+    Uma coluna-opção de bloco MR aparece em dois formatos possíveis: o
+    original (texto da opção repetido / vazio quando não marcado) ou o
+    otimizado por convert_to_parquet.py (booleano puro, True = marcado --
+    ver _optimize_memory lá). Os dois precisam funcionar aqui porque
+    list_variables.py e testes locais às vezes leem xlsx cru direto, sem
+    passar pela otimização. Um booleano puro nunca é "nulo" -- .notna()
+    nele sempre devolveria True e marcaria todo mundo como selecionado,
+    por isso o branch por dtype.
+    """
+    if pd.api.types.is_bool_dtype(col):
+        return col.fillna(False).astype(bool)
+    return col.notna()
+
+
 def to_long(
     data: pd.DataFrame,
     meta: dict[str, VariableMeta],
@@ -88,7 +104,7 @@ def to_long(
         frames = []
         for m in option_metas:
             col = _get_series(data, m.name)
-            mask = col.notna()
+            mask = _mr_selected_mask(col)
             idx = data.index[mask]
             frames.append(pd.DataFrame({
                 "resp_id": idx,
@@ -128,7 +144,7 @@ def eligible_respondents(
         option_names = [m.name for m in meta.values() if m.var_type == VarType.MR_OPTION and m.mr_group == key]
         any_selected = pd.Series(False, index=data.index)
         for name in option_names:
-            any_selected |= _get_series(data, name).notna()
+            any_selected |= _mr_selected_mask(_get_series(data, name))
         return data.index[any_selected]
 
     m = meta[key]
@@ -144,6 +160,8 @@ class BannerBlock:
     banner_key: str
     banner_label: str
     pct: pd.DataFrame          # linhas = categorias do stub, colunas = categorias do banner, valores = % coluna
+    cell_n: pd.DataFrame       # N não ponderado por célula (mesma forma de pct) -- vira a linha "NA"
+    cell_weighted: pd.DataFrame  # N ponderado por célula, pré-divisão -- usado pra calcular %LINHA
     base_n: pd.Series          # N não ponderado por categoria do banner
     small_n_flag: pd.Series    # True onde base_n < limiar
     coverage_warning: str | None = None  # ver _check_coverage
@@ -179,6 +197,28 @@ def _check_coverage(stub_long_filtered: pd.DataFrame, threshold: float = 0.9) ->
     return None
 
 
+def _check_base_coverage(banner_n: int, total_n: int, threshold: float = 0.9) -> str | None:
+    """
+    Segundo tipo de aviso, diferente de _check_coverage: não é a base estar
+    concentrada num balde só do stub, é a base elegível pra essa variável de
+    banner ser bem menor que o Total da tabela -- geralmente lógica de pulo
+    (a pergunta não foi feita pra todo mundo). Achado real: "utiliza água de
+    poço" tinha base de 64.216 contra Total de 85.201 (75,4%) -- sem esse
+    aviso, só dava pra perceber somando a linha Base Amostra na mão, que foi
+    exatamente como esse caso apareceu.
+    """
+    if total_n <= 0:
+        return None
+    coverage = banner_n / total_n
+    if coverage < threshold:
+        return (
+            f"Base elegível cobre só {coverage:.0%} do Total ({banner_n} de "
+            f"{total_n}) -- resto provavelmente não foi elegível pra essa "
+            f"pergunta (lógica de pulo), não é erro de conta."
+        )
+    return None
+
+
 def _build_single_block(
     data: pd.DataFrame,
     meta: dict[str, VariableMeta],
@@ -187,6 +227,7 @@ def _build_single_block(
     weights: pd.Series,
     na_handling: str,
     small_n_threshold: int,
+    total_n: int,
 ) -> BannerBlock:
     stub_long = to_long(data, meta, stub_key, weights, na_handling)
     banner_long = to_long(data, meta, banner_key, weights, na_handling)
@@ -208,17 +249,29 @@ def _build_single_block(
     joined = stub_long.merge(banner_long, on="resp_id", suffixes=("_stub", "_banner"))
     cell_weighted = joined.groupby(["category_stub", "category_banner"])["weight_stub"].sum()
     cell_table = cell_weighted.unstack("category_banner").reindex(columns=base_weighted.index)
+    cell_n_table = (
+        joined.groupby(["category_stub", "category_banner"])["resp_id"]
+        .nunique()
+        .unstack("category_banner")
+        .reindex(columns=base_weighted.index)
+        .fillna(0)
+        .astype(int)
+    )
 
     pct = cell_table.divide(base_weighted, axis=1) * 100
     pct = pct.fillna(0.0)
+
+    coverage_warning = _check_coverage(stub_long) or _check_base_coverage(len(both_elig), total_n)
 
     return BannerBlock(
         banner_key=banner_key,
         banner_label=get_label(meta, banner_key),
         pct=pct,
+        cell_n=cell_n_table.reindex(index=pct.index, fill_value=0),
+        cell_weighted=cell_table.fillna(0.0),
         base_n=base_n.reindex(pct.columns).fillna(0).astype(int),
         small_n_flag=(base_n.reindex(pct.columns).fillna(0) < small_n_threshold),
-        coverage_warning=_check_coverage(stub_long),
+        coverage_warning=coverage_warning,
     )
 
 
@@ -251,18 +304,24 @@ def build_banner(
     total_base_pairs = stub_long_all.drop_duplicates(["resp_id"])
     total_weighted = total_base_pairs["weight"].sum()
     total_cell = stub_long_all.groupby("category")["weight"].sum()
+    total_cell_n = total_base_pairs.groupby("category")["resp_id"].nunique()
     total_pct = (total_cell / total_weighted * 100).to_frame("Total")
     total_block = BannerBlock(
         banner_key=total_meta_key,
         banner_label="Total",
         pct=total_pct,
+        cell_n=total_cell_n.reindex(total_pct.index).fillna(0).astype(int).to_frame("Total"),
+        cell_weighted=total_cell.reindex(total_pct.index).fillna(0.0).to_frame("Total"),
         base_n=pd.Series({"Total": total_base_pairs["resp_id"].nunique()}),
         small_n_flag=pd.Series({"Total": total_base_pairs["resp_id"].nunique() < small_n_threshold}),
     )
     blocks.append(total_block)
 
     for bk in banner_keys:
-        block = _build_single_block(data, meta, stub_key, bk, weights, na_handling, small_n_threshold)
+        block = _build_single_block(
+            data, meta, stub_key, bk, weights, na_handling, small_n_threshold,
+            total_n=total_base_pairs["resp_id"].nunique(),
+        )
         if block.pct.empty:
             # Acontece quando a variável de banner não tem nenhum respondente
             # elegível nesse recorte (ex.: pergunta de um branch de rota que
@@ -272,6 +331,60 @@ def build_banner(
         blocks.append(block)
 
     return blocks
+
+
+def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
+    """
+    Formato completo -- NA (contagem não ponderada), %LINHA e %COLUNA por
+    célula, o padrão clássico de banner do SPSS/Quantum, com três linhas por
+    categoria do stub em vez de uma.
+
+    %COLUNA é o que já calculávamos (`pct`). %LINHA é novo: cada célula
+    dividida pelo total ponderado da PRÓPRIA categoria do stub (o bloco
+    "Total", que é sempre o primeiro de `blocks` por construção de
+    `build_banner`) -- não pela base da coluna, que é o denominador do
+    %COLUNA.
+    """
+    total_block = blocks[0]
+    stub_categories = list(total_block.pct.index)
+    row_totals_weighted = total_block.cell_weighted["Total"]
+
+    n_frames, linha_frames, coluna_frames = [], [], []
+    for b in blocks:
+        cols = pd.MultiIndex.from_product([[b.banner_label], b.pct.columns])
+
+        n_frame = b.cell_n.copy()
+        n_frame.columns = cols
+        n_frames.append(n_frame)
+
+        coluna_frame = b.pct.copy()
+        coluna_frame.columns = cols
+        coluna_frames.append(coluna_frame)
+
+        linha_frame = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
+        linha_frame = linha_frame.fillna(0.0)
+        linha_frame.columns = cols
+        linha_frames.append(linha_frame)
+
+    na_table = pd.concat(n_frames, axis=1).fillna(0).astype(int)
+    linha_table = pd.concat(linha_frames, axis=1).fillna(0.0).round(1)
+    coluna_table = pd.concat(coluna_frames, axis=1).fillna(0.0).round(1)
+
+    rows: dict[tuple[str, str], pd.Series] = {}
+    for cat in stub_categories:
+        rows[(cat, "NA")] = na_table.loc[cat]
+        rows[(cat, "%LINHA")] = linha_table.loc[cat]
+        rows[(cat, "%COLUNA")] = coluna_table.loc[cat]
+
+    base_na = na_table.sum(axis=0)
+    base_total_na = base_na[("Total", "Total")]
+    rows[("Base Amostra", "NA")] = base_na
+    rows[("Base Amostra", "%LINHA")] = (base_na / base_total_na * 100).round(1) if base_total_na else base_na * 0.0
+    rows[("Base Amostra", "%COLUNA")] = pd.Series(100.0, index=base_na.index).round(1)
+
+    table = pd.DataFrame(rows).T
+    table.index = pd.MultiIndex.from_tuples(table.index)
+    return table
 
 
 def format_banner_table(blocks: list[BannerBlock]) -> pd.DataFrame:
@@ -309,3 +422,25 @@ def small_n_mask(blocks: list[BannerBlock]) -> pd.DataFrame:
         )
         masks.append(m)
     return pd.concat(masks, axis=1)
+
+
+def small_n_mask_full(blocks: list[BannerBlock]) -> pd.DataFrame:
+    """
+    Mesma ideia de small_n_mask, mas pro formato NA/%LINHA/%COLUNA de
+    format_banner_table_full -- a marcação de N pequeno vale pra coluna
+    inteira (é a base daquela coluna que é pequena, não uma métrica
+    específica), então se repete nas 3 linhas de cada categoria do stub e
+    também nas 3 linhas de "Base Amostra".
+    """
+    total_block = blocks[0]
+    stub_categories = list(total_block.pct.index)
+    col_masks = []
+    for b in blocks:
+        cols = pd.MultiIndex.from_product([[b.banner_label], b.pct.columns])
+        col_masks.append(pd.Series(b.small_n_flag.reindex(b.pct.columns).values, index=cols))
+    flat = pd.concat(col_masks)
+
+    row_labels = [(cat, metric) for cat in stub_categories for metric in ("NA", "%LINHA", "%COLUNA")]
+    row_labels += [("Base Amostra", metric) for metric in ("NA", "%LINHA", "%COLUNA")]
+    index = pd.MultiIndex.from_tuples(row_labels)
+    return pd.DataFrame(np.tile(flat.values, (len(index), 1)), index=index, columns=flat.index)

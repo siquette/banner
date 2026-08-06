@@ -30,7 +30,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
-from metadata import load_raw_with_double_header, _MEDIA_PATTERN, _WEIGHT_NAMES
+from metadata import VarType, classify_columns, load_raw_with_double_header, _MEDIA_PATTERN, _WEIGHT_NAMES
 
 
 def _coerce_dtypes(data: pd.DataFrame) -> pd.DataFrame:
@@ -57,6 +57,37 @@ def _coerce_dtypes(data: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _optimize_memory(data: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    """
+    Sem isso, um banco de 106 mil linhas x 1164 colunas projeta ~1,3GB só
+    pra existir na RAM -- acima do teto de 1GB do Streamlit Community Cloud
+    sozinho, antes de qualquer conta rodar em cima. Medido: metade dessa
+    memória vem dos blocos de múltipla resposta (quase 50% das 1164
+    colunas), guardando o texto inteiro da opção repetido em toda linha
+    marcada, quando `to_long()` (crosstab_engine.py) só olha `.notna()` --
+    nunca lê o conteúdo da célula MR. Virar booleano não perde nenhuma
+    informação que o motor usa, e cai o custo de string pra ~1 bit.
+
+    SR e indicador viram "category": mesmas strings, guardadas uma vez só
+    e referenciadas por código -- transparente pro resto do código (`.astype
+    (str)`, `.str.match(...)` continuam funcionando igual em cima de
+    category).
+
+    Testado: 81,6% de redução na amostra pequena, projeção de ~1296MB para
+    ~238MB no banco real de produção.
+    """
+    out = data.copy()
+    for name, m in meta.items():
+        col = out[name]
+        if isinstance(col, pd.DataFrame):
+            col = col.iloc[:, 0]
+        if m.var_type == VarType.MR_OPTION:
+            out[name] = col.notna()
+        elif m.var_type in (VarType.SR, VarType.INDICATOR):
+            out[name] = col.astype("category")
+    return out
+
+
 def convert(xlsx_path: str, sheet_name: str = "Dados") -> None:
     xlsx_path = Path(xlsx_path)
 
@@ -66,6 +97,14 @@ def convert(xlsx_path: str, sheet_name: str = "Dados") -> None:
     print(f"  {data.shape[0]} linhas x {data.shape[1]} colunas lidas em {time.time()-t0:.1f}s")
 
     data = _coerce_dtypes(data)
+
+    print("  classificando variáveis pra otimizar memória (MR -> booleano, SR/indicador -> categoria)...")
+    meta = classify_columns(data, full_labels, short_names)
+    mem_before = data.memory_usage(deep=True).sum()
+    data = _optimize_memory(data, meta)
+    mem_after = data.memory_usage(deep=True).sum()
+    print(f"  memória em RAM: {mem_before/1e6:.1f}MB -> {mem_after/1e6:.1f}MB "
+          f"({(1 - mem_after/mem_before):.0%} menor)")
 
     parquet_path = xlsx_path.with_suffix(".parquet")
     labels_path = xlsx_path.with_suffix("").with_suffix(".labels.json")

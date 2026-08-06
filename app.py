@@ -27,7 +27,6 @@ from metadata import (
     VarType,
     classify_columns,
     crossable_variables,
-    get_label,
     load_parquet_with_labels,
 )
 from crosstab_engine import build_banner, format_banner_table_full, get_column_series, small_n_mask_full
@@ -182,21 +181,19 @@ def main() -> None:
         "abaixo do limiar definido — leia o percentual com cautela."
     )
 
-    st.subheader("Gráfico")
-    chart_banner_label = get_label(meta, banner_keys[0])
-    chosen_block = next((b for b in blocks if b.banner_label == chart_banner_label), blocks[-1] if len(blocks) > 1 else blocks[0])
-    pct = chosen_block.pct
-
-    fig = go.Figure()
-    for col in pct.columns:
-        fig.add_trace(go.Bar(name=str(col), x=pct.index.astype(str), y=pct[col]))
-    fig.update_layout(
-        barmode="group",
-        title=f"{options[stub_key]} por {chart_banner_label}",
-        yaxis_title="%",
-        legend_title=chart_banner_label,
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Gráficos")
+    for b in blocks[1:]:  # blocks[0] é sempre "Total" -- não faz gráfico próprio, já está implícito em cada um dos outros
+        pct = b.pct
+        fig = go.Figure()
+        for col in pct.columns:
+            fig.add_trace(go.Bar(name=str(col), x=pct.index.astype(str), y=pct[col]))
+        fig.update_layout(
+            barmode="group",
+            title=f"{options[stub_key]} por {b.banner_label}",
+            yaxis_title="%",
+            legend_title=b.banner_label,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
     st.download_button(
         "Baixar banner (CSV)",

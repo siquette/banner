@@ -4,12 +4,19 @@ Interface do gerador de banner. Fina de propósito: toda a lógica pesada
 resposta) está em metadata.py e crosstab_engine.py, testados isoladamente.
 Este arquivo só orquestra widgets e desenha o resultado.
 
+Banco fixo: lê sempre o mesmo .parquet, commitado no repo ao lado deste
+arquivo (gerado uma vez por convert_to_parquet.py, fora do app -- ver
+README). Sem uploader nem campo de caminho -- não faz sentido pra um app
+com um cliente/estudo fixo, e evita reintroduzir a leitura de xlsx cru
+(lenta, ~35s pra 14,5MB) dentro do container do Streamlit Cloud.
+
 Rodar localmente:
     pixi run streamlit run app.py
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -22,33 +29,22 @@ from metadata import (
     crossable_variables,
     get_label,
     load_parquet_with_labels,
-    load_raw_with_double_header,
 )
 from crosstab_engine import build_banner, format_banner_table, get_column_series, small_n_mask
 
 st.set_page_config(page_title="Gerador de Banner", layout="wide")
 
+# Caminho fixo do banco, relativo a este arquivo -- funciona igual local e
+# no Streamlit Cloud, porque nos dois casos o diretório de trabalho é a
+# raiz do repositório clonado. BANNER_DATA_PATH sobrescreve isso via
+# variável de ambiente, só pra testar outro arquivo localmente sem editar
+# código -- nunca é setada em produção.
+DATA_PATH = Path(os.environ.get("BANNER_DATA_PATH", str(Path(__file__).parent / "df_completo_v2_corrigido.parquet")))
 
-@st.cache_data(show_spinner="Lendo e classificando o arquivo...")
-def _load_and_classify(source: bytes | str, sheet_name: str, is_parquet: bool):
-    """
-    `source` é bytes (upload, sempre xlsx) ou uma string de caminho local
-    (xlsx ou parquet). `is_parquet` decide qual leitor usar -- ele próprio
-    também entra no cache key, então trocar de formato no mesmo caminho de
-    texto (não deveria acontecer, mas por segurança) ainda invalida o cache.
 
-    Por que parquet existe como opção separada: leitura de xlsx largo via
-    openpyxl é da ordem de minutos pra um arquivo de centenas de MB (medido:
-    ~35s pra 14,5MB). parquet é colunar e ~76x mais rápido de ler de volta.
-    Ver convert_to_parquet.py -- é ele que gera o .parquet + .labels.json
-    que essa função consome quando is_parquet=True.
-    """
-    if is_parquet:
-        data, full_labels, short_names = load_parquet_with_labels(source)
-    else:
-        import io
-        buffer = io.BytesIO(source) if isinstance(source, bytes) else source
-        data, full_labels, short_names = load_raw_with_double_header(buffer, sheet_name=sheet_name)
+@st.cache_data(show_spinner="Carregando o banco...")
+def _load_and_classify(path: str):
+    data, full_labels, short_names = load_parquet_with_labels(path)
     meta = classify_columns(data, full_labels, short_names)
     return data, meta
 
@@ -60,35 +56,10 @@ def main() -> None:
         "com múltipla resposta tratada automaticamente — sem pivotar nada manualmente antes."
     )
 
-    with st.sidebar:
-        st.header("1. Dados")
-        uploaded = st.file_uploader(
-            "Planilha (linha 1 = pergunta completa, linha 2 = código curto)",
-            type=["xlsx"],
-        )
-        local_path = st.text_input(
-            "ou caminho local (.xlsx ou .parquet)",
-            value="",
-            placeholder="/home/ro/dados/df_completo.parquet",
-            help=(
-                "Só funciona rodando localmente. Para arquivo grande (dezenas/"
-                "centenas de MB), converta primeiro com convert_to_parquet.py "
-                "e aponte pro .parquet aqui -- é dezenas de vezes mais rápido "
-                "que ler o .xlsx original a cada sessão."
-            ),
-        )
-        if uploaded is None and not local_path:
-            st.info("Envie um arquivo ou informe um caminho local para começar.")
-            st.stop()
-
-        is_parquet = local_path.lower().endswith(".parquet") if local_path else False
-        sheet_name = st.text_input("Nome da aba", value="Dados", disabled=is_parquet)
-
-    source = uploaded.getvalue() if uploaded is not None else local_path
     try:
-        data, meta = _load_and_classify(source, sheet_name, is_parquet)
+        data, meta = _load_and_classify(str(DATA_PATH))
     except Exception as exc:  # noqa: BLE001 -- é uma fronteira de UI, queremos mensagem legível, não traceback
-        st.error(f"Não consegui ler esse arquivo: {exc}")
+        st.error(f"Não consegui carregar {DATA_PATH.name}: {exc}")
         st.stop()
 
     entries = crossable_variables(meta)
@@ -101,7 +72,7 @@ def main() -> None:
     )
 
     with st.sidebar:
-        st.header("2. Filtro de base (opcional)")
+        st.header("1. Filtro de base (opcional)")
         filter_keys = st.multiselect(
             "Restringir a base a...",
             options=list(options.keys()),
@@ -123,7 +94,7 @@ def main() -> None:
             chosen = st.multiselect(f"Manter em '{options[fk]}'", options=available, default=available, key=f"filter_{fk}")
             active_filters[fk] = chosen
 
-        st.header("3. Cruzamento")
+        st.header("2. Cruzamento")
         stub_key = st.selectbox(
             "Variável de linha (stub)",
             options=list(options.keys()),
@@ -135,7 +106,7 @@ def main() -> None:
             format_func=lambda k: options[k],
         )
 
-        st.header("4. Regras")
+        st.header("3. Regras")
         na_handling = st.radio(
             "Categoria 'N/A - ...' em indicadores",
             options=["keep", "exclude"],

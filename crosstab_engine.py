@@ -167,7 +167,7 @@ class BannerBlock:
     coverage_warning: str | None = None  # ver _check_coverage
 
 
-def _check_coverage(stub_long_filtered: pd.DataFrame, threshold: float = 0.9) -> str | None:
+def _check_coverage(stub_long_filtered: pd.DataFrame, stub_label: str, threshold: float = 0.9) -> str | None:
     """
     Detecta um problema diferente de N pequeno: a população elegível pro
     cruzamento inteiro concentrada numa única categoria do stub. Isso
@@ -180,6 +180,9 @@ def _check_coverage(stub_long_filtered: pd.DataFrame, threshold: float = 0.9) ->
     existiu. N pequeno não pega isso porque a base total pode ser grande
     (577 pessoas, no caso real); o problema é a base inteira estar num só
     balde do stub, não o tamanho dela.
+
+    Texto em linguagem simples de propósito -- quem usa o app não
+    necessariamente sabe o que é "lógica de pulo" ou "stub".
     """
     if stub_long_filtered.empty:
         return None
@@ -189,10 +192,11 @@ def _check_coverage(stub_long_filtered: pd.DataFrame, threshold: float = 0.9) ->
     top_cat, top_share = dist.index[0], dist.iloc[0]
     if top_share >= threshold:
         return (
-            f"{top_share:.0%} da base elegível pra esse cruzamento está em "
-            f"'{top_cat}' -- essa variável de banner provavelmente só existe "
-            f"nessa categoria do stub (ex.: só foi perguntada numa onda "
-            f"específica), não é diferença de comportamento real."
+            f"Quase todo mundo que respondeu essa pergunta é do grupo "
+            f"'{top_cat}' em {stub_label} ({top_share:.0%}) -- provavelmente "
+            f"a pergunta só foi feita pra esse grupo. Não dá pra comparar "
+            f"{stub_label} de forma justa aqui, porque os outros grupos "
+            f"quase não têm gente respondendo."
         )
     return None
 
@@ -206,15 +210,19 @@ def _check_base_coverage(banner_n: int, total_n: int, threshold: float = 0.9) ->
     poço" tinha base de 64.216 contra Total de 85.201 (75,4%) -- sem esse
     aviso, só dava pra perceber somando a linha Base Amostra na mão, que foi
     exatamente como esse caso apareceu.
+
+    Texto em linguagem simples de propósito -- "lógica de pulo" é jargão de
+    quem constrói questionário, não de quem lê o banner.
     """
     if total_n <= 0:
         return None
     coverage = banner_n / total_n
     if coverage < threshold:
         return (
-            f"Base elegível cobre só {coverage:.0%} do Total ({banner_n} de "
-            f"{total_n}) -- resto provavelmente não foi elegível pra essa "
-            f"pergunta (lógica de pulo), não é erro de conta."
+            f"Só {banner_n} de {total_n} pessoas do Total responderam essa "
+            f"pergunta ({coverage:.0%}) -- provavelmente ela não foi feita "
+            f"pra todo mundo. Os percentuais estão certos, só valem pra "
+            f"esse grupo menor, não pro Total inteiro."
         )
     return None
 
@@ -261,7 +269,7 @@ def _build_single_block(
     pct = cell_table.divide(base_weighted, axis=1) * 100
     pct = pct.fillna(0.0)
 
-    coverage_warning = _check_coverage(stub_long) or _check_base_coverage(len(both_elig), total_n)
+    coverage_warning = _check_coverage(stub_long, get_label(meta, stub_key)) or _check_base_coverage(len(both_elig), total_n)
 
     return BannerBlock(
         banner_key=banner_key,
@@ -304,7 +312,14 @@ def build_banner(
     total_base_pairs = stub_long_all.drop_duplicates(["resp_id"])
     total_weighted = total_base_pairs["weight"].sum()
     total_cell = stub_long_all.groupby("category")["weight"].sum()
-    total_cell_n = total_base_pairs.groupby("category")["resp_id"].nunique()
+    # NUNCA usar total_base_pairs (deduplicado por resp_id) aqui -- quando o
+    # stub é MR, uma pessoa com 2 seleções precisa contar nas 2 categorias.
+    # total_base_pairs serve só pra "quantas pessoas distintas no total"
+    # (total_weighted, base_n, small_n_flag abaixo), não pra "quantas por
+    # categoria". Bug real que existiu aqui: usar total_base_pairs pra isso
+    # fazia pessoas com múltiplas seleções perderem a segunda categoria --
+    # com P2.1a, "Encanada" mostrava 60 em vez de 69.
+    total_cell_n = stub_long_all.groupby("category")["resp_id"].nunique()
     total_pct = (total_cell / total_weighted * 100).to_frame("Total")
     total_block = BannerBlock(
         banner_key=total_meta_key,
@@ -385,6 +400,27 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     table = pd.DataFrame(rows).T
     table.index = pd.MultiIndex.from_tuples(table.index)
     return table
+
+
+def format_table_for_export(table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Versão em texto de format_banner_table_full, pra exportar em CSV.
+
+    A tabela original guarda tudo em float64 -- não é bug de conta, é
+    limitação do pandas: linha NA (inteiro) e linhas %LINHA/%COLUNA
+    (decimal) compartilham as mesmas colunas, e uma coluna só pode ter um
+    tipo só, então tudo vira float. Na tela isso fica escondido porque o
+    Streamlit formata na exibição (100.0 aparece como "100"); no CSV
+    exportado não tem essa máscara, o valor cru aparece com ".0" -- foi
+    assim que esse bug apareceu. Aqui a formatação (inteiro pra NA, 1 casa
+    decimal pro resto) vira texto de verdade antes de gerar o CSV, pra o
+    arquivo exportado bater com o que a tela mostra.
+    """
+    out = table.copy().astype(object)
+    na_rows = table.index.get_level_values(1) == "NA"
+    out.loc[na_rows] = table.loc[na_rows].map(lambda v: f"{v:,.0f}")
+    out.loc[~na_rows] = table.loc[~na_rows].map(lambda v: f"{v:.1f}")
+    return out
 
 
 def format_banner_table(blocks: list[BannerBlock]) -> pd.DataFrame:

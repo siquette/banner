@@ -29,7 +29,13 @@ from metadata import (
     crossable_variables,
     load_parquet_with_labels,
 )
-from crosstab_engine import build_banner, format_banner_table_full, get_column_series, small_n_mask_full
+from crosstab_engine import (
+    build_banner,
+    format_banner_table_full,
+    format_table_for_export,
+    get_column_series,
+    small_n_mask_full,
+)
 
 st.set_page_config(page_title="Gerador de Banner", layout="wide")
 
@@ -197,7 +203,7 @@ def main() -> None:
 
     st.download_button(
         "Baixar banner (CSV)",
-        data=table.to_csv().encode("utf-8"),
+        data=format_table_for_export(table).to_csv().encode("utf-8"),
         file_name="banner.csv",
         mime="text/csv",
     )

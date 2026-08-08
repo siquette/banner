@@ -157,17 +157,58 @@ def main() -> None:
     table = format_banner_table_full(blocks)
     mask = small_n_mask_full(blocks)
 
-    for b in blocks:
+    if active_filters:
+        # Total sem filtro nenhum -- só pra comparação lado a lado com o
+        # Total já filtrado que o resto da tabela usa. banner_keys=[] faz
+        # build_banner devolver só o bloco Total, sem cruzar nada.
+        unfiltered_blocks = build_banner(data, meta, stub_key, [], na_handling, small_n_threshold)
+        unfiltered_table = format_banner_table_full(unfiltered_blocks)
+        unfiltered_mask = small_n_mask_full(unfiltered_blocks)
+        unfiltered_table.columns = pd.MultiIndex.from_tuples(
+            [("Total geral (sem filtro)", c[1]) for c in unfiltered_table.columns]
+        )
+        unfiltered_mask.columns = unfiltered_table.columns
+        table = pd.concat([unfiltered_table, table], axis=1)
+        mask = pd.concat([unfiltered_mask, mask], axis=1)
+
+    total_n_ref = blocks[0].base_n["Total"]
+    for b in blocks[1:]:
+        own_n = b.base_n.sum()
+        pct = own_n / total_n_ref * 100 if total_n_ref else 0
+        st.caption(f"**{b.banner_label}**: resposta de {own_n:,} de {total_n_ref:,} ({pct:.1f}%)")
         if b.coverage_warning:
             st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
 
     st.subheader(f"{options[stub_key]}")
 
+    with st.expander("❓ Como ler esses números"):
+        st.markdown(
+            "- **NA** — quantas pessoas de verdade estão nessa célula (contagem, não ponderada).\n"
+            "- **%LINHA** — dentro dessa categoria do stub (a variável de linha, à esquerda), "
+            "que % foi pra cada opção da pergunta. Responde \"como esse grupo se comporta\".\n"
+            "- **%COLUNA** — o inverso: dentro dessa opção da pergunta, que % é de cada categoria "
+            "do stub. Responde \"quem escolheu essa opção\" — o perfil, não o comportamento.\n"
+            "- **Base Amostra** — o total de cada coluna, somando todas as categorias do stub.\n"
+            "- **Total** — a base inteira do stub (todo mundo, independente da pergunta de banner "
+            "escolhida). Nunca é a base específica de uma pergunta — pra isso, veja a legenda "
+            "logo acima da tabela (\"resposta de X de Y\").\n"
+            "- **Total geral (sem filtro)** — só aparece se você aplicou um filtro de base; é o "
+            "Total de antes do filtro, pra comparação lado a lado.\n"
+            "- **Células em amarelo** — a base ali é menor que o limiar definido na barra lateral; "
+            "leia esse percentual com cautela, poucos respondentes sustentam esse número.\n"
+            "- **Aviso amarelo acima da tabela** — sinaliza base concentrada numa categoria só do "
+            "stub, ou cobertura baixa da pergunta (nem todo mundo respondeu) — não é erro de conta.\n"
+            "- Se %LINHA de uma categoria não soma perto de 100%, é sinal de que nem todo mundo "
+            "daquele grupo respondeu a pergunta.\n"
+            "- **Gráfico de %LINHA** compara grupos entre si; **gráfico de %COLUNA** mostra o "
+            "perfil de quem escolheu cada opção — geralmente %LINHA é a leitura mais direta."
+        )
+
     def _highlight_small_n(_: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=table.index, columns=table.columns)
         for col in mask.columns:
             styles.loc[mask.index, col] = mask[col].map(
-                lambda flagged: "background-color: #fff3cd" if flagged else ""
+                lambda flagged: "background-color: #fff3cd; color: #000000" if flagged else ""
             )
         return styles
 
@@ -188,18 +229,69 @@ def main() -> None:
     )
 
     st.subheader("Gráficos")
+    chart_type = st.radio(
+        "Tipo de gráfico",
+        options=["Barras", "Linha"],
+        horizontal=True,
+        help=(
+            "Linha só faz sentido quando as categorias do stub têm ordem natural "
+            "(ex.: Ano, faixa etária, escala de concordância). Pra categorias sem "
+            "ordem (ex.: Gênero, Região), a linha sugere uma tendência que não "
+            "existe -- use Barras nesses casos."
+        ),
+    )
+    row_totals_weighted = blocks[0].cell_weighted["Total"]  # base ponderada de cada categoria do stub, pro %LINHA
     for b in blocks[1:]:  # blocks[0] é sempre "Total" -- não faz gráfico próprio, já está implícito em cada um dos outros
-        pct = b.pct
-        fig = go.Figure()
-        for col in pct.columns:
-            fig.add_trace(go.Bar(name=str(col), x=pct.index.astype(str), y=pct[col]))
-        fig.update_layout(
-            barmode="group",
-            title=f"{options[stub_key]} por {b.banner_label}",
-            yaxis_title="%",
-            legend_title=b.banner_label,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        # %LINHA: "como esse grupo do stub se distribui nessa pergunta" --
+        # leitura mais natural pra comparar grupos entre si.
+        pct_linha = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
+        pct_linha = pct_linha.fillna(0.0)
+        # %COLUNA: "quem compõe cada resposta" -- já vem pronto em b.pct.
+        pct_coluna = b.pct
+
+        col_linha, col_coluna = st.columns(2)
+
+        with col_linha:
+            fig1 = go.Figure()
+            for col in pct_linha.columns:
+                hover = (
+                    f"{options[stub_key]}: %{{x}}<br>"
+                    f"{b.banner_label}: {col}<br>"
+                    "%{y:.1f}% desse grupo<extra></extra>"
+                )
+                if chart_type == "Barras":
+                    fig1.add_trace(go.Bar(name=str(col), x=pct_linha.index.astype(str), y=pct_linha[col], hovertemplate=hover))
+                else:
+                    fig1.add_trace(go.Scatter(name=str(col), x=pct_linha.index.astype(str), y=pct_linha[col], mode="lines+markers", hovertemplate=hover))
+            fig1.update_layout(
+                barmode="group",
+                title=f"{options[stub_key]} por {b.banner_label} — %LINHA",
+                yaxis_title=f"% dentro de cada grupo de {options[stub_key]}",
+                legend_title=b.banner_label,
+            )
+            st.plotly_chart(fig1, use_container_width=True)
+            st.caption("Como cada grupo se distribui nessa pergunta — compare grupos entre si.")
+
+        with col_coluna:
+            fig2 = go.Figure()
+            for col in pct_coluna.columns:
+                hover = (
+                    f"{b.banner_label}: {col}<br>"
+                    f"{options[stub_key]}: %{{x}}<br>"
+                    "%{y:.1f}% de quem respondeu isso<extra></extra>"
+                )
+                if chart_type == "Barras":
+                    fig2.add_trace(go.Bar(name=str(col), x=pct_coluna.index.astype(str), y=pct_coluna[col], hovertemplate=hover))
+                else:
+                    fig2.add_trace(go.Scatter(name=str(col), x=pct_coluna.index.astype(str), y=pct_coluna[col], mode="lines+markers", hovertemplate=hover))
+            fig2.update_layout(
+                barmode="group",
+                title=f"{options[stub_key]} por {b.banner_label} — %COLUNA",
+                yaxis_title="% de quem escolheu cada opção",
+                legend_title=b.banner_label,
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+            st.caption("Quem compõe cada resposta — o perfil de quem escolheu cada opção.")
 
     st.download_button(
         "Baixar banner (CSV)",

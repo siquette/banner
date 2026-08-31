@@ -1,33 +1,56 @@
 """
-Motor de cruzamento ponderado, com suporte nativo a múltipla resposta.
+crosstab_engine.py — Motor de cruzamento ponderado, com suporte nativo a
+múltipla resposta.
 
-Decisão central de arquitetura: em vez de pivotar o df inteiro (caro, com
-1164 colunas seria bobagem materializar tudo de uma vez), normalizamos cada
-variável -- SR, indicador ou bloco MR -- para o MESMO formato "longo" só na
-hora em que ela é selecionada no filtro:
+PAPEL NO PROJETO
+-----------------
+Recebe o df já classificado por `metadata.py` e faz a conta de verdade:
+cruza duas variáveis (stub x banner), pondera por peso amostral, monta a
+tabela no formato NA/%LINHA/%COLUNA, e decide quando avisar que um número
+merece leitura cautelosa (base pequena, cobertura baixa/concentrada).
+`app.py` só chama `build_banner` e desenha o resultado -- toda a
+estatística mora aqui.
+
+DECISÃO CENTRAL DE ARQUITETURA -- O FORMATO "LONGO"
+------------------------------------------------------
+Em vez de pivotar o df inteiro (caro -- com 1164 colunas seria bobagem
+materializar tudo de uma vez), normalizamos cada variável -- SR, indicador
+ou bloco MR -- para o MESMO formato "longo" só na hora em que ela é
+selecionada no cruzamento:
 
     resp_id | category | weight
 
 Uma SR vira uma linha por respondente. Um bloco MR vira várias linhas por
-respondente (uma por opção marcada) -- esse é o "pivotar que você faz no
-Power BI", só que automático e sob demanda. Depois disso, cruzar qualquer
-combinação SR x SR, SR x MR, MR x MR é o mesmo merge + groupby, porque os
-dois lados já estão no mesmo formato. É essa normalização que elimina o
-retrabalho manual por pergunta.
+respondente (uma por opção marcada) -- esse é o "pivotar que se faz no
+Power BI", só que automático e sob demanda (`to_long`, mais abaixo).
+Depois disso, cruzar qualquer combinação SR x SR, SR x MR, MR x MR é o
+mesmo merge + groupby, porque os dois lados já estão no mesmo formato. É
+essa normalização que elimina o retrabalho manual por pergunta.
 
-Duas convenções estatísticas fixadas aqui, e o porquê:
+DUAS CONVENÇÕES ESTATÍSTICAS FIXADAS AQUI, E O PORQUÊ
+---------------------------------------------------------
+1. Percentual usa peso (PESO), mas "Base Amostra"/NA reporta N não
+   ponderado. É o padrão de mercado: o peso corrige a leitura do %, mas
+   quem decide se uma célula é confiável estatisticamente é o tamanho
+   real da amostra, não o tamanho ponderado (que pode parecer maior ou
+   menor que a realidade).
 
-1. Percentual usa peso (PESO), mas "Base Amostra" reporta N não ponderado.
-   É o padrão de mercado: o peso corrige a leitura do %, mas quem decide se
-   uma célula é confiável estatisticamente é o tamanho real da amostra, não
-   o tamanho ponderado (que pode parecer maior ou menor que a realidade).
+2. A base de uma variável MR é "respondentes com pelo menos 1 opção
+   marcada no bloco" -- não dá para distinguir com certeza, só pelos
+   dados, quem foi filtrado por lógica de pulo de quem foi perguntado e
+   marcou zero opções. Isso é uma limitação real, documentada aqui, não
+   escondida. Se o bloco tiver uma opção explícita tipo "Nenhuma", ela
+   funciona como o marcador de "perguntado e respondeu nada", e a base
+   fica correta automaticamente.
 
-2. A base de uma variável MR é "respondentes com pelo menos 1 opção marcada
-   no bloco" -- não dá para distinguir com certeza, só pelos dados, quem foi
-   filtrado por lógica de pulo de quem foi perguntado e marcou zero opções.
-   Isso é uma limitação real, documentada aqui, não escondida. Se o bloco tiver
-   uma opção explícita tipo "Nenhuma", ela funciona como o marcador de
-   "perguntado e respondeu nada", e a base fica correta automaticamente.
+ADVERTÊNCIA CONHECIDA -- STUB DE MÚLTIPLA RESPOSTA
+------------------------------------------------------
+Quando a variável de STUB (linha) é MR, uma pessoa com 2+ seleções conta
+em 2+ linhas da tabela -- por isso %COLUNA pode somar mais de 100% nesse
+caso, e "Base Amostra"/NA soma mais que o total de respondentes. Isso é
+correto matematicamente (reflete múltipla seleção de verdade), não é bug,
+mas é diferente do caso comum (stub de resposta única, onde tudo soma
+100%) e vale ter em mente ao interpretar.
 """
 
 from __future__ import annotations
@@ -42,8 +65,12 @@ from metadata import VariableMeta, VarType, get_label
 _NA_TEXT_PATTERN = r"^N/A\b"
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  PESO E ACESSO SEGURO A COLUNA
+# ══════════════════════════════════════════════════════════════════════
+
 def get_weights(data: pd.DataFrame, meta: dict[str, VariableMeta]) -> pd.Series:
-    """Devolve a série de pesos alinhada ao índice do df. Peso 1.0 se não houver coluna PESO."""
+    """Devolve a série de pesos alinhada ao índice do df. Peso 1.0 pra toda linha se não houver coluna PESO."""
     weight_names = [m.name for m in meta.values() if m.var_type == VarType.WEIGHT]
     if not weight_names:
         return pd.Series(1.0, index=data.index)
@@ -54,27 +81,47 @@ def get_weights(data: pd.DataFrame, meta: dict[str, VariableMeta]) -> pd.Series:
 
 
 def _get_series(data: pd.DataFrame, name: str) -> pd.Series:
+    """
+    `data[name]` protegido contra nome curto duplicado -- quando o Excel de
+    origem tem duas colunas com o mesmo nome curto (aconteceu 4x no banco
+    real), `metadata.load_raw_with_double_header` desambigua com sufixo
+    `__dupN`, mas se algum outro caminho de leitura não desambiguar,
+    `data[name]` devolveria um DataFrame de 2 colunas em vez de uma
+    Series. Pega sempre a primeira, pra nunca quebrar silenciosamente
+    mais adiante num `.notna()`/`.astype()` que só faz sentido em Series.
+    """
     col = data[name]
-    if isinstance(col, pd.DataFrame):  # nomes curtos duplicados no arquivo original
+    if isinstance(col, pd.DataFrame):
         col = col.iloc[:, 0]
     return col
 
 
 def get_column_series(data: pd.DataFrame, name: str) -> pd.Series:
-    """Wrapper público de _get_series -- pra app.py não precisar importar nome privado do módulo."""
+    """Wrapper público de `_get_series` -- pra app.py/indices.py não precisarem importar nome privado do módulo."""
     return _get_series(data, name)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  NORMALIZAÇÃO PRO FORMATO LONGO
+# ══════════════════════════════════════════════════════════════════════
+
 def _mr_selected_mask(col: pd.Series) -> pd.Series:
     """
-    Uma coluna-opção de bloco MR aparece em dois formatos possíveis: o
-    original (texto da opção repetido / vazio quando não marcado) ou o
-    otimizado por convert_to_parquet.py (booleano puro, True = marcado --
-    ver _optimize_memory lá). Os dois precisam funcionar aqui porque
-    list_variables.py e testes locais às vezes leem xlsx cru direto, sem
-    passar pela otimização. Um booleano puro nunca é "nulo" -- .notna()
-    nele sempre devolveria True e marcaria todo mundo como selecionado,
-    por isso o branch por dtype.
+    "Essa opção foi marcada?" pra uma coluna-opção de bloco MR -- que
+    aparece em dois formatos possíveis:
+
+    - Original: texto da opção repetido quando marcado, célula vazia
+      quando não.
+    - Otimizado por `convert_to_parquet.py`: booleano puro, True =
+      marcado (ver `_optimize_memory` lá -- criado porque guardar o texto
+      da opção repetido em toda linha marcada gasta memória à toa, quando
+      só a presença importa aqui).
+
+    Os dois precisam funcionar aqui porque `list_variables.py` e testes
+    locais às vezes leem xlsx cru direto, sem passar pela otimização. Um
+    booleano puro nunca é "nulo" -- `.notna()` nele sempre devolveria
+    True e marcaria todo mundo como selecionado, por isso o branch por
+    dtype em vez de só chamar `.notna()` sempre.
     """
     if pd.api.types.is_bool_dtype(col):
         return col.fillna(False).astype(bool)
@@ -89,13 +136,20 @@ def to_long(
     na_handling: str = "keep",
 ) -> pd.DataFrame:
     """
-    Normaliza uma variável (SR, indicador ou bloco MR identificado por `key`)
-    para o formato longo resp_id | category | weight.
+    Normaliza uma variável (SR, indicador ou bloco MR identificado por
+    `key`) para o formato longo `resp_id | category | weight` -- ver
+    docstring do módulo pro porquê desse formato ser o alicerce do motor.
 
-    na_handling: 'keep' mantém a categoria "N/A - ..." de indicadores como
-    categoria própria; 'exclude' remove essas linhas (a % passa a ser só de
-    quem de fato respondeu). Não se aplica a SR nem a MR -- lá "não preenchido"
-    já significa "não elegível", tratado em `eligible_respondents`.
+    Uma SR/indicador vira no máximo uma linha por respondente. Um bloco MR
+    vira zero, uma ou várias linhas por respondente (uma por opção
+    marcada) -- é aqui, dentro dessa função, que o "pivotar" que se faria
+    manualmente acontece, sob demanda.
+
+    `na_handling`: 'keep' mantém a categoria "N/A - ..." de indicadores
+    como categoria própria; 'exclude' remove essas linhas (a % passa a
+    ser só de quem de fato respondeu). Não se aplica a SR nem a MR -- lá
+    "não preenchido" já significa "não elegível", tratado em
+    `eligible_respondents`, não é uma categoria "N/A" de texto.
     """
     is_mr = any(m.var_type == VarType.MR_OPTION and m.mr_group == key for m in meta.values())
 
@@ -136,8 +190,14 @@ def eligible_respondents(
 ) -> pd.Index:
     """
     Índice de respondentes elegíveis para a variável `key` -- ou seja, o
-    universo que deveria compor a base do banner para essa variável, antes
-    de cruzar com qualquer outra coisa.
+    universo que deveria compor a base do banner para essa variável,
+    antes de cruzar com qualquer outra coisa.
+
+    Pra SR/indicador: quem não é nulo (e, se `na_handling='exclude'`,
+    também não é "N/A - ..." textual). Pra MR: união de quem marcou
+    QUALQUER opção do bloco -- ver a limitação documentada no módulo
+    sobre não dar pra distinguir "pulou a pergunta" de "respondeu e não
+    marcou nada".
     """
     is_mr = any(m.var_type == VarType.MR_OPTION and m.mr_group == key for m in meta.values())
     if is_mr:
@@ -155,31 +215,49 @@ def eligible_respondents(
     return data.index[mask]
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  ESTRUTURA DE RESULTADO
+# ══════════════════════════════════════════════════════════════════════
+
 @dataclass
 class BannerBlock:
+    """
+    Resultado de cruzar UMA variável de banner contra o stub (mais o
+    bloco especial "Total", sem cruzamento nenhum -- ver `build_banner`).
+    Uma lista de `BannerBlock` (sempre com "Total" primeiro) é a moeda
+    comum entre `build_banner` e as funções de formatação/exportação
+    mais abaixo.
+    """
     banner_key: str
     banner_label: str
-    pct: pd.DataFrame          # linhas = categorias do stub, colunas = categorias do banner, valores = % coluna
-    cell_n: pd.DataFrame       # N não ponderado por célula (mesma forma de pct) -- vira a linha "NA"
-    cell_weighted: pd.DataFrame  # N ponderado por célula, pré-divisão -- usado pra calcular %LINHA
-    base_n: pd.Series          # N não ponderado por categoria do banner
-    small_n_flag: pd.Series    # True onde base_n < limiar
-    coverage_warning: str | None = None  # ver _check_coverage
+    pct: pd.DataFrame              # linhas = categorias do stub, colunas = categorias do banner, valores = % coluna
+    cell_n: pd.DataFrame           # N não ponderado por célula (mesma forma de pct) -- vira a linha "NA"
+    cell_weighted: pd.DataFrame    # N ponderado por célula, pré-divisão -- usado pra calcular %LINHA
+    base_n: pd.Series              # N não ponderado por categoria do banner
+    small_n_flag: pd.Series        # True onde base_n < limiar
+    coverage_warning: str | None = None  # ver _check_coverage / _check_base_coverage
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  AVISOS DE COBERTURA
+# ══════════════════════════════════════════════════════════════════════
+# Dois problemas diferentes de "esse número pode enganar", nenhum dos
+# dois pego pelo alerta de N pequeno (que só olha tamanho de base, não a
+# FORMA como essa base está distribuída ou de onde ela vem).
 
 def _check_coverage(stub_long_filtered: pd.DataFrame, stub_label: str, threshold: float = 0.9) -> str | None:
     """
-    Detecta um problema diferente de N pequeno: a população elegível pro
-    cruzamento inteiro concentrada numa única categoria do stub. Isso
-    aconteceu de verdade no banco de produção -- um bloco de múltipla
-    resposta (motivo de não conectar à rede) só tinha respondente do ano de
-    2024, porque a pergunta simplesmente não foi feita nas outras ondas do
-    estudo consolidado. O resultado (100% em 2024, 0% nos outros anos, em
-    TODAS as opções do bloco) é aritmeticamente correto, mas não descreve
-    diferença de comportamento entre anos -- descreve em que ano a pergunta
-    existiu. N pequeno não pega isso porque a base total pode ser grande
-    (577 pessoas, no caso real); o problema é a base inteira estar num só
-    balde do stub, não o tamanho dela.
+    Detecta a base elegível pro cruzamento inteiro concentrada numa única
+    categoria do stub. Aconteceu de verdade no banco de produção -- um
+    bloco de múltipla resposta (motivo de não conectar à rede) só tinha
+    respondente do ano de 2024, porque a pergunta simplesmente não foi
+    feita nas outras ondas do estudo consolidado. O resultado (100% em
+    2024, 0% nos outros anos, em TODAS as opções do bloco) é
+    aritmeticamente correto, mas não descreve diferença de comportamento
+    entre anos -- descreve em que ano a pergunta existiu. N pequeno não
+    pega isso porque a base total pode ser grande (577 pessoas, no caso
+    real); o problema é a base inteira estar num só balde do stub, não o
+    tamanho dela.
 
     Texto em linguagem simples de propósito -- quem usa o app não
     necessariamente sabe o que é "lógica de pulo" ou "stub".
@@ -203,16 +281,17 @@ def _check_coverage(stub_long_filtered: pd.DataFrame, stub_label: str, threshold
 
 def _check_base_coverage(banner_n: int, total_n: int, threshold: float = 0.9) -> str | None:
     """
-    Segundo tipo de aviso, diferente de _check_coverage: não é a base estar
-    concentrada num balde só do stub, é a base elegível pra essa variável de
-    banner ser bem menor que o Total da tabela -- geralmente lógica de pulo
-    (a pergunta não foi feita pra todo mundo). Achado real: "utiliza água de
-    poço" tinha base de 64.216 contra Total de 85.201 (75,4%) -- sem esse
-    aviso, só dava pra perceber somando a linha Base Amostra na mão, que foi
-    exatamente como esse caso apareceu.
+    Segundo tipo de aviso, diferente de `_check_coverage`: não é a base
+    estar concentrada num balde só do stub, é a base elegível pra essa
+    variável de banner ser bem menor que o Total da tabela -- geralmente
+    lógica de pulo (a pergunta não foi feita pra todo mundo). Achado
+    real: "utiliza água de poço" tinha base de 64.216 contra Total de
+    85.201 (75,4%) -- sem esse aviso, só dava pra perceber somando a
+    linha Base Amostra na mão, que foi exatamente como esse caso
+    apareceu.
 
-    Texto em linguagem simples de propósito -- "lógica de pulo" é jargão de
-    quem constrói questionário, não de quem lê o banner.
+    Texto em linguagem simples de propósito -- "lógica de pulo" é jargão
+    de quem constrói questionário, não de quem lê o banner.
     """
     if total_n <= 0:
         return None
@@ -227,6 +306,10 @@ def _check_base_coverage(banner_n: int, total_n: int, threshold: float = 0.9) ->
     return None
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  MOTOR DE CRUZAMENTO
+# ══════════════════════════════════════════════════════════════════════
+
 def _build_single_block(
     data: pd.DataFrame,
     meta: dict[str, VariableMeta],
@@ -237,6 +320,25 @@ def _build_single_block(
     small_n_threshold: int,
     total_n: int,
 ) -> BannerBlock:
+    """
+    Cruza UMA variável de banner contra o stub. Chamada uma vez por
+    variável selecionada em `build_banner` -- nunca chamada diretamente
+    de fora deste módulo (por isso o nome com `_`).
+
+    Passo a passo:
+    1. Normaliza os dois lados pro formato longo (`to_long`).
+    2. Restringe aos respondentes elegíveis pros DOIS lados ao mesmo
+       tempo (`both_elig`) -- interseção, não união, porque a base de um
+       cruzamento é sempre "quem podia responder as duas perguntas".
+    3. `merge` dos dois formatos longos por `resp_id`: se qualquer um dos
+       lados for MR (várias linhas por pessoa), o merge naturalmente gera
+       o produto cartesiano das seleções dessa pessoa -- é assim que uma
+       pessoa com 2 respostas na variável A e 2 na B conta corretamente
+       nas 4 combinações, sem código especial pra múltipla resposta na
+       hora do cruzamento em si.
+    4. Agrupa por par de categoria (stub, banner) pra somar peso (%) e
+       contar distinto (NA).
+    """
     stub_long = to_long(data, meta, stub_key, weights, na_handling)
     banner_long = to_long(data, meta, banner_key, weights, na_handling)
 
@@ -247,9 +349,10 @@ def _build_single_block(
     stub_long = stub_long[stub_long.resp_id.isin(both_elig)]
     banner_long = banner_long[banner_long.resp_id.isin(both_elig)]
 
-    # Base por categoria do banner: respondentes distintos elegíveis para o
-    # stub, dentro de cada categoria do banner. dropna por resp_id+categoria
-    # evita contar a mesma opção 2x (não deveria acontecer, mas é barato garantir).
+    # Base por categoria do banner: respondentes distintos elegíveis para
+    # o stub, dentro de cada categoria do banner. drop_duplicates por
+    # resp_id+categoria evita contar a mesma opção 2x (não deveria
+    # acontecer, mas é barato garantir).
     base_pairs = banner_long.drop_duplicates(["resp_id", "category"])
     base_weighted = base_pairs.groupby("category")["weight"].sum()
     base_n = base_pairs.groupby("category")["resp_id"].nunique()
@@ -292,14 +395,21 @@ def build_banner(
     small_n_threshold: int = 30,
 ) -> list[BannerBlock]:
     """
-    Ponto de entrada principal. Um bloco por variável de banner selecionada --
-    é assim que uma tabela banner de verdade é composta: cada corte (Região,
-    Gênero, Cliente x Não Cliente...) é cruzado independentemente contra o
-    mesmo stub, não combinado entre si.
+    Ponto de entrada principal do motor -- é a única função deste módulo
+    que `app.py` chama diretamente pra gerar um banner.
 
-    A primeira coluna sempre é "Total" -- toda a base elegível para o stub,
-    sem nenhum corte de banner -- porque é a referência que todo banner real
-    tem antes das colunas de corte.
+    Um `BannerBlock` por variável de banner selecionada -- é assim que
+    uma tabela banner de verdade é composta: cada corte (Região, Gênero,
+    Cliente x Não Cliente...) é cruzado independentemente contra o mesmo
+    stub, não combinado entre si.
+
+    O primeiro bloco da lista devolvida é sempre "Total" -- toda a base
+    elegível para o stub, sem nenhum corte de banner -- porque é a
+    referência que todo banner real tem antes das colunas de corte, e é
+    o que `format_banner_table_full`/`format_table_for_export` usam como
+    denominador do %LINHA. `banner_keys=[]` devolve só esse bloco Total
+    (usado por `app.py` pra montar a coluna "Total geral (sem filtro)"
+    quando um filtro de base está ativo).
     """
     weights = get_weights(data, meta)
 
@@ -312,13 +422,14 @@ def build_banner(
     total_base_pairs = stub_long_all.drop_duplicates(["resp_id"])
     total_weighted = total_base_pairs["weight"].sum()
     total_cell = stub_long_all.groupby("category")["weight"].sum()
-    # NUNCA usar total_base_pairs (deduplicado por resp_id) aqui -- quando o
-    # stub é MR, uma pessoa com 2 seleções precisa contar nas 2 categorias.
-    # total_base_pairs serve só pra "quantas pessoas distintas no total"
-    # (total_weighted, base_n, small_n_flag abaixo), não pra "quantas por
-    # categoria". Bug real que existiu aqui: usar total_base_pairs pra isso
-    # fazia pessoas com múltiplas seleções perderem a segunda categoria --
-    # com P2.1a, "Encanada" mostrava 60 em vez de 69.
+    # NUNCA usar total_base_pairs (deduplicado por resp_id) pra contar por
+    # categoria -- quando o stub é MR, uma pessoa com 2 seleções precisa
+    # contar nas 2 categorias. total_base_pairs serve só pra "quantas
+    # pessoas distintas no total" (total_weighted, base_n, small_n_flag
+    # abaixo), não pra "quantas por categoria". Bug real que existiu
+    # aqui: usar total_base_pairs pra isso fazia pessoas com múltiplas
+    # seleções perderem a segunda categoria -- com P2.1a, "Encanada"
+    # mostrava 60 em vez de 69.
     total_cell_n = stub_long_all.groupby("category")["resp_id"].nunique()
     total_pct = (total_cell / total_weighted * 100).to_frame("Total")
     total_block = BannerBlock(
@@ -338,27 +449,34 @@ def build_banner(
             total_n=total_base_pairs["resp_id"].nunique(),
         )
         if block.pct.empty:
-            # Acontece quando a variável de banner não tem nenhum respondente
-            # elegível nesse recorte (ex.: pergunta de um branch de rota que
-            # ninguém caiu nesse estudo/onda). Não é erro -- é sinal de que
-            # essa variável não se aplica a esse recorte de dados.
+            # Acontece quando a variável de banner não tem nenhum
+            # respondente elegível nesse recorte (ex.: pergunta de um
+            # branch de rota que ninguém caiu nesse estudo/onda). Não é
+            # erro -- é sinal de que essa variável não se aplica a esse
+            # recorte de dados, então simplesmente não entra na lista.
             continue
         blocks.append(block)
 
     return blocks
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  FORMATAÇÃO DE SAÍDA
+# ══════════════════════════════════════════════════════════════════════
+
 def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     """
-    Formato completo -- NA (contagem não ponderada), %LINHA e %COLUNA por
-    célula, o padrão clássico de banner do SPSS/Quantum, com três linhas por
-    categoria do stub em vez de uma.
+    Monta a tabela completa pra exibição -- NA (contagem não ponderada),
+    %LINHA e %COLUNA por célula, o padrão clássico de banner do
+    SPSS/Quantum, com três linhas por categoria do stub (mais três pra
+    "Base Amostra" no final) em vez de uma linha só.
 
-    %COLUNA é o que já calculávamos (`pct`). %LINHA é novo: cada célula
-    dividida pelo total ponderado da PRÓPRIA categoria do stub (o bloco
-    "Total", que é sempre o primeiro de `blocks` por construção de
-    `build_banner`) -- não pela base da coluna, que é o denominador do
-    %COLUNA.
+    %COLUNA é o que `_build_single_block` já calcula (`pct`): dentro da
+    categoria do banner, qual a fatia de cada categoria do stub. %LINHA é
+    o inverso: cada célula dividida pelo total ponderado da PRÓPRIA
+    categoria do stub (vem do bloco "Total", que é sempre `blocks[0]` por
+    construção de `build_banner`) -- não pela base da coluna, que é o
+    denominador do %COLUNA.
     """
     total_block = blocks[0]
     stub_categories = list(total_block.pct.index)
@@ -404,7 +522,7 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
 
 def format_table_for_export(table: pd.DataFrame) -> pd.DataFrame:
     """
-    Versão em texto de format_banner_table_full, pra exportar em CSV.
+    Versão em texto de `format_banner_table_full`, pra exportar em CSV.
 
     A tabela original guarda tudo em float64 -- não é bug de conta, é
     limitação do pandas: linha NA (inteiro) e linhas %LINHA/%COLUNA
@@ -412,9 +530,10 @@ def format_table_for_export(table: pd.DataFrame) -> pd.DataFrame:
     tipo só, então tudo vira float. Na tela isso fica escondido porque o
     Streamlit formata na exibição (100.0 aparece como "100"); no CSV
     exportado não tem essa máscara, o valor cru aparece com ".0" -- foi
-    assim que esse bug apareceu. Aqui a formatação (inteiro pra NA, 1 casa
-    decimal pro resto) vira texto de verdade antes de gerar o CSV, pra o
-    arquivo exportado bater com o que a tela mostra.
+    assim que esse bug foi percebido pela primeira vez. Aqui a formatação
+    (inteiro pra NA, 1 casa decimal pro resto) vira texto de verdade
+    antes de gerar o CSV, pra o arquivo exportado bater com o que a tela
+    mostra.
     """
     out = table.copy().astype(object)
     na_rows = table.index.get_level_values(1) == "NA"
@@ -423,50 +542,16 @@ def format_table_for_export(table: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def format_banner_table(blocks: list[BannerBlock]) -> pd.DataFrame:
-    """
-    Junta os blocos num único DataFrame de exibição: colunas em MultiIndex
-    (variável de banner, categoria), linha extra "Base Amostra" no topo,
-    igual à convenção que aparece nas suas planilhas SPC.
-    """
-    pct_frames = []
-    base_row = {}
-    for b in blocks:
-        cols = pd.MultiIndex.from_product([[b.banner_label], b.pct.columns])
-        frame = b.pct.copy()
-        frame.columns = cols
-        pct_frames.append(frame)
-        for cat, n in b.base_n.items():
-            base_row[(b.banner_label, cat)] = n
-
-    table = pd.concat(pct_frames, axis=1).fillna(0.0).round(1)
-    table.index.name = None
-    base_series = pd.Series(base_row)
-    base_series.index = pd.MultiIndex.from_tuples(base_series.index)
-    table.loc["Base Amostra"] = base_series.reindex(table.columns)
-    return table
-
-
-def small_n_mask(blocks: list[BannerBlock]) -> pd.DataFrame:
-    """Máscara booleana (mesmo shape de format_banner_table, sem a linha Base Amostra) para estilizar células de N pequeno."""
-    masks = []
-    for b in blocks:
-        cols = pd.MultiIndex.from_product([[b.banner_label], b.pct.columns])
-        m = pd.DataFrame(
-            np.tile(b.small_n_flag.reindex(b.pct.columns).values, (len(b.pct.index), 1)),
-            index=b.pct.index, columns=cols,
-        )
-        masks.append(m)
-    return pd.concat(masks, axis=1)
-
-
 def small_n_mask_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     """
-    Mesma ideia de small_n_mask, mas pro formato NA/%LINHA/%COLUNA de
-    format_banner_table_full -- a marcação de N pequeno vale pra coluna
-    inteira (é a base daquela coluna que é pequena, não uma métrica
-    específica), então se repete nas 3 linhas de cada categoria do stub e
-    também nas 3 linhas de "Base Amostra".
+    Máscara booleana do mesmo formato (linhas/colunas) de
+    `format_banner_table_full`, pra `app.py` colorir de amarelo toda
+    célula cuja base está abaixo do limiar.
+
+    A marcação de N pequeno vale pra COLUNA inteira (é a base daquela
+    coluna que é pequena, não uma métrica específica dela) -- por isso o
+    mesmo `small_n_flag` de cada bloco se repete nas 3 linhas de cada
+    categoria do stub, e também nas 3 linhas de "Base Amostra".
     """
     total_block = blocks[0]
     stub_categories = list(total_block.pct.index)

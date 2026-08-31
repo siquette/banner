@@ -1,23 +1,37 @@
 """
-Conversão única de xlsx (cabeçalho duplo) para parquet + rótulos.
+convert_to_parquet.py — Conversão única de xlsx (cabeçalho duplo) pra
+parquet otimizado + rótulos.
 
-Por que isso é um script separado, fora do app: ler um xlsx largo com
-openpyxl custa minutos, não segundos -- medi 35s pra ler 14,5MB de teste
-(3060 linhas x 1164 colunas); pra 405MB reais, projeção de 15-20min. Pagar
-esse custo dentro do Streamlit, a cada sessão, era o que tornava o app
-impraticável. Aqui você paga uma vez, offline, e o app passa a ler o
-resultado -- parquet é colunar e ~76x mais rápido pra ler de volta.
+PAPEL NO PROJETO
+-----------------
+Script standalone, roda FORA do Streamlit, nunca importado por `app.py`.
+É o único jeito de atualizar o banco: rodar isso de novo e commitar o
+`.parquet` + `.labels.json` resultantes no repositório.
 
-Uso:
+POR QUE ISSO É UM SCRIPT SEPARADO
+------------------------------------
+Ler um xlsx largo com openpyxl custa minutos, não segundos -- medido
+~35s pra 14,5MB de teste (3060 linhas x 1164 colunas); pros ~156MB reais
+do banco de produção (106.217 linhas), ~7min. Pagar esse custo dentro do
+Streamlit, a cada sessão, era o que tornava o app impraticável. Aqui você
+paga uma vez, offline, e o app passa a ler o resultado -- parquet é
+colunar e ~76x mais rápido pra ler de volta, e a otimização de memória
+feita aqui (ver `_optimize_memory`) derruba o uso de RAM em ~82%,
+essencial pro teto de 1GB do Streamlit Community Cloud.
+
+USO
+----
     python convert_to_parquet.py /caminho/df_completo.xlsx [nome_da_aba]
 
 Gera, ao lado do xlsx:
-    df_completo.parquet        -- os dados, colunas com nome curto
+    df_completo.parquet        -- os dados, colunas com nome curto, já
+                                   otimizados pra memória
     df_completo.labels.json    -- {short_names, full_labels}
 
-O sidecar de rótulos existe porque parquet só guarda nome de coluna, não as
-duas linhas de cabeçalho do Excel -- sem ele, a linha 1 (pergunta completa)
-se perderia na conversão, e o banner voltaria a mostrar código cru.
+O sidecar de rótulos existe porque parquet só guarda nome de coluna, não
+as duas linhas de cabeçalho do Excel -- sem ele, a linha 1 (pergunta
+completa) se perderia na conversão, e o banner voltaria a mostrar código
+cru em vez de pergunta legível.
 """
 
 from __future__ import annotations
@@ -30,21 +44,32 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
+# _MEDIA_PATTERN e _WEIGHT_NAMES são "privados" de metadata.py (prefixo
+# _), mas importados aqui de propósito -- são os MESMOS padrões que
+# classify_columns usa pra reconhecer coluna de peso e companion numérico.
+# Reimportar em vez de duplicar a regex garante que os dois módulos nunca
+# divirjam sobre o que conta como "_media" ou "coluna de peso".
 from metadata import VarType, classify_columns, load_raw_with_double_header, _MEDIA_PATTERN, _WEIGHT_NAMES
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  AJUSTE DE TIPO E OTIMIZAÇÃO DE MEMÓRIA
+# ══════════════════════════════════════════════════════════════════════
 
 def _coerce_dtypes(data: pd.DataFrame) -> pd.DataFrame:
     """
     pyarrow (o motor do parquet) exige tipo consistente por coluna. Uma
     planilha de pesquisa real mistura número e texto na mesma coluna com
-    frequência (ex.: CRIANCAS com "0 - Nenhuma" numa linha e um número puro
-    noutra) -- não é bug do arquivo, é como Excel deixa acontecer, e foi
-    exatamente isso que quebrou minha primeira tentativa de benchmark.
+    frequência (ex.: CRIANCAS com "0 - Nenhuma" numa linha e um número
+    puro noutra) -- não é bug do arquivo, é como Excel deixa acontecer, e
+    foi exatamente isso que quebrou a primeira tentativa de benchmark
+    deste projeto.
 
-    Regra: PESO e colunas "_media" viram numéricas de verdade, porque entram
-    em conta matemática (soma ponderada, média). Todo o resto vira texto --
-    é o que são, semanticamente: categoria, mesmo quando o rótulo parece
-    número.
+    Regra: PESO e colunas "_media" viram numéricas de verdade, porque
+    entram em conta matemática (soma ponderada, média). Todo o resto vira
+    texto -- é o que são, semanticamente: categoria, mesmo quando o
+    rótulo parece número (ex.: uma faixa de renda codificada como "1",
+    "2", "3" ainda é categoria, não teria sentido somar/tirar média).
     """
     out = data.copy()
     for col in out.columns:
@@ -59,27 +84,28 @@ def _coerce_dtypes(data: pd.DataFrame) -> pd.DataFrame:
 
 def _optimize_memory(data: pd.DataFrame, meta: dict) -> pd.DataFrame:
     """
-    Sem isso, um banco de 106 mil linhas x 1164 colunas projeta ~1,3GB só
-    pra existir na RAM -- acima do teto de 1GB do Streamlit Community Cloud
-    sozinho, antes de qualquer conta rodar em cima. Medido: metade dessa
-    memória vem dos blocos de múltipla resposta (quase 50% das 1164
-    colunas), guardando o texto inteiro da opção repetido em toda linha
-    marcada, quando `to_long()` (crosstab_engine.py) só olha `.notna()` --
-    nunca lê o conteúdo da célula MR. Virar booleano não perde nenhuma
-    informação que o motor usa, e cai o custo de string pra ~1 bit.
+    Sem isso, o banco de produção (106 mil linhas x 1164 colunas) projeta
+    ~1,3GB só pra existir na RAM -- acima do teto de 1GB do Streamlit
+    Community Cloud sozinho, antes de qualquer conta rodar em cima.
+    Medido: metade dessa memória vem dos blocos de múltipla resposta
+    (quase 50% das 1164 colunas), guardando o texto inteiro da opção
+    repetido em toda linha marcada, quando `to_long()`
+    (`crosstab_engine.py`) só olha `.notna()` -- nunca lê o conteúdo da
+    célula MR. Virar booleano não perde nenhuma informação que o motor
+    usa, e cai o custo de string pra ~1 bit por célula.
 
     SR e indicador viram "category": mesmas strings, guardadas uma vez só
-    e referenciadas por código -- transparente pro resto do código (`.astype
-    (str)`, `.str.match(...)` continuam funcionando igual em cima de
-    category).
+    e referenciadas por código -- transparente pro resto do código
+    (`.astype(str)`, `.str.match(...)` continuam funcionando igual em
+    cima de category).
 
-    Testado: 81,6% de redução na amostra pequena, projeção de ~1296MB para
-    ~238MB no banco real de produção.
+    Medido: 81,6% de redução na amostra pequena de teste; 83% no banco
+    real de produção (1268MB -> 221MB).
     """
     out = data.copy()
     for name, m in meta.items():
         col = out[name]
-        if isinstance(col, pd.DataFrame):
+        if isinstance(col, pd.DataFrame):  # nome curto duplicado não desambiguado
             col = col.iloc[:, 0]
         if m.var_type == VarType.MR_OPTION:
             out[name] = col.notna()
@@ -88,7 +114,19 @@ def _optimize_memory(data: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  CONVERSÃO
+# ══════════════════════════════════════════════════════════════════════
+
 def convert(xlsx_path: str, sheet_name: str = "Dados") -> None:
+    """
+    Lê o xlsx bruto, ajusta tipo, classifica, otimiza memória, e escreve
+    `.parquet` + `.labels.json` ao lado do arquivo de origem. Imprime
+    progresso e métricas (tempo de leitura, redução de memória, tamanho
+    final) -- é intencional que rode como script visível no terminal, não
+    silencioso, já que a etapa de leitura demora minutos e a pessoa
+    precisa saber que não travou.
+    """
     xlsx_path = Path(xlsx_path)
 
     t0 = time.time()

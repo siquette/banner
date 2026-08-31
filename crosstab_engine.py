@@ -60,7 +60,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from metadata import VariableMeta, VarType, get_label
+from metadata import VariableMeta, VarType, get_label, sort_categories
 
 _NA_TEXT_PATTERN = r"^N/A\b"
 
@@ -356,6 +356,12 @@ def _build_single_block(
     base_pairs = banner_long.drop_duplicates(["resp_id", "category"])
     base_weighted = base_pairs.groupby("category")["weight"].sum()
     base_n = base_pairs.groupby("category")["resp_id"].nunique()
+    # Ordem de leitura (escala conhecida do melhor pro pior, indicador
+    # 1->5, residual por último) em vez da ordem alfabética que sai do
+    # groupby -- tudo daqui pra baixo reindexa por base_weighted.index,
+    # então reordenar só ela já propaga pra cell_table/cell_n_table/pct.
+    base_weighted = base_weighted.reindex(sort_categories(list(base_weighted.index)))
+    base_n = base_n.reindex(base_weighted.index)
 
     joined = stub_long.merge(banner_long, on="resp_id", suffixes=("_stub", "_banner"))
     cell_weighted = joined.groupby(["category_stub", "category_banner"])["weight_stub"].sum()
@@ -422,6 +428,10 @@ def build_banner(
     total_base_pairs = stub_long_all.drop_duplicates(["resp_id"])
     total_weighted = total_base_pairs["weight"].sum()
     total_cell = stub_long_all.groupby("category")["weight"].sum()
+    # Ordem de leitura das categorias do stub (linhas da tabela) -- mesma
+    # lógica do banner acima, aplicada aqui porque é total_cell.index que
+    # vira stub_categories em format_banner_table_full.
+    total_cell = total_cell.reindex(sort_categories(list(total_cell.index)))
     # NUNCA usar total_base_pairs (deduplicado por resp_id) pra contar por
     # categoria -- quando o stub é MR, uma pessoa com 2 seleções precisa
     # contar nas 2 categorias. total_base_pairs serve só pra "quantas

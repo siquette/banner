@@ -52,7 +52,7 @@ from crosstab_engine import (
     small_n_mask_full,
 )
 from indices import compute_index_trend, compute_quadrant_data, indicator_media_map
-from metadata import VarType, classify_columns, crossable_variables, load_parquet_with_labels
+from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels
 
 st.set_page_config(page_title="Gerador de Banner", layout="wide")
 
@@ -106,23 +106,55 @@ def _build_chart(
     nome do stub); `value_context` é uma frase curta pro hover explicando
     o que o número representa (ex.: "desse grupo", "de quem respondeu
     isso").
+
+    DUAS DECISÕES DE UX:
+
+    1. Legenda embaixo do gráfico, horizontal, não à direita (padrão do
+       Plotly) -- à direita, a legenda cria uma faixa vertical de largura
+       fixa que sobra pouco espaço de fato pro gráfico quando ele já está
+       dividido ao meio (dois gráficos lado a lado, %LINHA e %COLUNA) --
+       com 5 categorias de escala, a legenda vertical podia ocupar mais
+       largura que o próprio gráfico.
+    2. Cor por categoria reconhecida (`metadata.category_color`) --
+       verde/vermelho reforça visualmente a mesma ordem "melhor pro pior"
+       que `sort_categories` já aplica nos dados, em vez da paleta
+       categórica padrão do Plotly (cores sem relação de intensidade
+       entre si, ex. azul/laranja/verde escolhidas só pra serem
+       distintas). Categoria fora do vocabulário conhecido (a maioria das
+       nominais) não recebe cor fixa, fica com a paleta padrão.
     """
     fig = go.Figure()
     horizontal = chart_type == "Barra horizontal"
     for col in pct_df.columns:
         cats = pct_df.index.astype(str)
         vals = pct_df[col]
+        color = category_color(str(col))
         if horizontal:
             hover = f"{col}<br>{category_label}: %{{y}}<br>%{{x:.1f}}% {value_context}<extra></extra>"
-            fig.add_trace(go.Bar(name=str(col), y=cats, x=vals, orientation="h", hovertemplate=hover))
+            fig.add_trace(go.Bar(
+                name=str(col), y=cats, x=vals, orientation="h", hovertemplate=hover,
+                marker_color=color,
+            ))
         else:
             hover = f"{category_label}: %{{x}}<br>{col}<br>%{{y:.1f}}% {value_context}<extra></extra>"
             if chart_type == "Barras":
-                fig.add_trace(go.Bar(name=str(col), x=cats, y=vals, hovertemplate=hover))
+                fig.add_trace(go.Bar(name=str(col), x=cats, y=vals, hovertemplate=hover, marker_color=color))
             else:  # Linha
-                fig.add_trace(go.Scatter(name=str(col), x=cats, y=vals, mode="lines+markers", hovertemplate=hover))
+                fig.add_trace(go.Scatter(
+                    name=str(col), x=cats, y=vals, mode="lines+markers", hovertemplate=hover,
+                    line=dict(color=color) if color else None,
+                    marker=dict(color=color) if color else None,
+                ))
 
-    layout = dict(barmode="group", title=title, legend_title=legend_title)
+    layout = dict(
+        barmode="group",
+        title=title,
+        legend=dict(
+            title=legend_title, orientation="h",
+            yanchor="top", y=-0.2, xanchor="center", x=0.5,
+        ),
+        margin=dict(b=100),  # espaço extra embaixo pra legenda não cortar
+    )
     if horizontal:
         layout["xaxis_title"] = value_axis_title
     else:

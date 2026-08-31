@@ -411,3 +411,142 @@ def _mr_group_stem(members: list[VariableMeta]) -> str:
     if len(members) == 1 and m.mr_option_label:
         stem = f"{stem} ({m.mr_option_label})"
     return stem
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ORDEM DE CATEGORIA (ESCALAS CONHECIDAS)
+# ══════════════════════════════════════════════════════════════════════
+# Sem isso, categoria de banner/stub sai na ordem que o pandas devolve de
+# um groupby -- que é ordem alfabética, não a ordem que faz sentido pra
+# quem lê ("Bom" antes de "Ótimo" alfabeticamente, mas ninguém lê uma
+# escala assim). Levantado contra o banco real: três famílias de escala
+# nomeadas no questionário (AVALIAÇÃO, CONFIANÇA, CONCORDÂNCIA), cada uma
+# com seu próprio vocabulário -- incluindo variante de gênero (ÓTIMO/
+# ÓTIMA, BOM/BOA, PÉSSIMO/PÉSSIMA, concordando com o substantivo da
+# pergunta). Categoria residual (não avaliou/não sabe) sempre ordena por
+# último, nunca no meio da escala.
+#
+# Isso é uma tabela fixa, não um algoritmo -- só cobre o vocabulário
+# encontrado no banco real até agora. Categoria não reconhecida cai no
+# fim, mantendo ordem alfabética entre si (nunca quebra, só não reordena
+# o que não conhece).
+
+_SCALE_RANK: dict[str, int] = {
+    # Avaliação: Ótimo -> Péssimo
+    "ÓTIMO": 0, "ÓTIMA": 0,
+    "BOM": 1, "BOA": 1,
+    "REGULAR": 2,
+    "RUIM": 3,
+    "PÉSSIMO": 4, "PÉSSIMA": 4,
+    # Confiança: Confio totalmente -> Desconfio totalmente
+    "CONFIO TOTALMENTE": 0,
+    "CONFIO UM POUCO": 1,
+    "NEM CONFIO / NEM DESCONFIO": 2,
+    "DESCONFIO UM POUCO": 3,
+    "DESCONFIO TOTALMENTE": 4,
+    # Concordância: Concordo totalmente -> Discordo totalmente
+    "CONCORDO TOTALMENTE": 0,
+    "CONCORDO PARCIALMENTE": 1,
+    "NEM CONCORDO, NEM DISCORDO": 2,
+    "DISCORDO UM POUCO": 3,
+    "DISCORDO TOTALMENTE": 4,
+}
+
+# Prefixo (já maiúsculo) que marca categoria residual -- sempre por
+# último, depois de qualquer categoria de escala reconhecida ou não.
+_RESIDUAL_PREFIXES = ("NÃO ", "NAO ", "N/A")
+
+# "Média próxima ou igual a 3 (>=2,5)" -- categoria de indicador (ver
+# VarType.INDICATOR). Extrai o número central pra ordenar 1 -> 5.
+_INDICATOR_SCALE_PATTERN = re.compile(r"M[ÉE]DIA\s+PR[ÓO]XIMA\s+OU\s+IGUAL\s+A\s+(\d+)", re.IGNORECASE)
+
+
+def _category_sort_key(category: str) -> tuple[int, int, str]:
+    """
+    Chave de ordenação pra uma única categoria -- usada por
+    `sort_categories` via `sorted(categories, key=_category_sort_key)`.
+
+    Devolve (grupo, posição, texto_original):
+    - grupo 0 = categoria de indicador (Média N), ordenada por N;
+    - grupo 0 também = categoria de escala conhecida (_SCALE_RANK);
+    - grupo 1 = categoria não reconhecida, mantém ordem alfabética;
+    - grupo 2 = categoria residual (Não avaliou, N/A...), sempre por
+      último.
+    O terceiro elemento (texto original) é o desempate dentro do mesmo
+    grupo/posição, e o motivo de nunca dar erro de comparação entre
+    tipos (`sorted` sempre compara tupla completa da esquerda pra
+    direita, só cai no texto se grupo E posição empatarem).
+    """
+    upper = category.strip().upper()
+
+    if any(upper.startswith(p) for p in _RESIDUAL_PREFIXES):
+        return (2, 0, upper)
+
+    indicator_match = _INDICATOR_SCALE_PATTERN.search(upper)
+    if indicator_match:
+        return (0, int(indicator_match.group(1)), upper)
+
+    if upper in _SCALE_RANK:
+        return (0, _SCALE_RANK[upper], upper)
+
+    return (1, 0, upper)
+
+
+def sort_categories(categories: list[str]) -> list[str]:
+    """
+    Reordena uma lista de categorias pra ordem de leitura (escala
+    conhecida do melhor pro pior, indicador de 1 a 5, residual sempre
+    por último) -- em vez da ordem alfabética que sai de um groupby do
+    pandas. Categoria fora do vocabulário conhecido (a maioria das
+    variáveis nominais, tipo Região/Gênero) mantém ordem alfabética
+    entre si, sem quebrar nem se misturar com as reconhecidas.
+    """
+    return sorted(categories, key=_category_sort_key)
+
+
+# Cor por posição na escala (0=melhor a 4=pior), em hexadecimal -- verde
+# pro extremo positivo, vermelho pro extremo negativo, cinza pro residual.
+# Usado só como sugestão visual em app.py (`_category_color`); categoria
+# fora da escala conhecida não recebe cor fixa, usa a paleta padrão do
+# Plotly.
+_SCALE_COLOR_BY_RANK = {
+    0: "#2E7D32",  # verde escuro -- melhor
+    1: "#8BC34A",  # verde claro
+    2: "#FDD835",  # amarelo -- neutro
+    3: "#FB8C00",  # laranja
+    4: "#C62828",  # vermelho -- pior
+}
+_RESIDUAL_COLOR = "#9E9E9E"  # cinza -- não avaliou/N/A
+
+
+def category_color(category: str) -> str | None:
+    """
+    Cor sugerida pra uma categoria de escala conhecida (incluindo
+    indicador Média 1-5), do verde (melhor) ao vermelho (pior), cinza
+    pra residual. Devolve `None` pra categoria fora do vocabulário
+    conhecido -- nesse caso, quem chama usa a paleta padrão do Plotly em
+    vez de forçar uma cor.
+
+    Não reaproveita a posição de `_category_sort_key` direto -- pra
+    indicador, a ORDEM de leitura é crescente (1,2,3,4,5, como eixo
+    numérico), mas a COR boa é o número MAIOR (5 = melhor nota),
+    invertido em relação às escalas de texto (onde a primeira posição da
+    lista já é a melhor). Sortear e colorir pela mesma posição pintaria
+    "Média 5" (a melhor nota) de vermelho -- foi exatamente esse bug que
+    apareceu testando antes desta função existir separada.
+    """
+    upper = category.strip().upper()
+
+    if any(upper.startswith(p) for p in _RESIDUAL_PREFIXES):
+        return _RESIDUAL_COLOR
+
+    indicator_match = _INDICATOR_SCALE_PATTERN.search(upper)
+    if indicator_match:
+        n = int(indicator_match.group(1))  # 1 (pior) a 5 (melhor)
+        rank = max(0, min(4, 5 - n))  # inverte: N=5 -> rank 0 (verde), N=1 -> rank 4 (vermelho)
+        return _SCALE_COLOR_BY_RANK.get(rank)
+
+    if upper in _SCALE_RANK:
+        return _SCALE_COLOR_BY_RANK.get(_SCALE_RANK[upper])
+
+    return None

@@ -94,6 +94,8 @@ def _build_chart(
     legend_title: str,
     category_label: str,
     value_context: str,
+    bargap: float = 0.2,
+    bargroupgap: float = 0.1,
 ) -> go.Figure:
     """
     Monta a figura pros três tipos de gráfico (Barras, Barra horizontal,
@@ -106,6 +108,15 @@ def _build_chart(
     nome do stub); `value_context` é uma frase curta pro hover explicando
     o que o número representa (ex.: "desse grupo", "de quem respondeu
     isso").
+
+    `bargap`/`bargroupgap` controlam largura/espaçamento de barra --
+    ignorados pelo Plotly quando `chart_type` é "Linha" (não tem barra),
+    não precisam de tratamento condicional aqui. Largura de barra em si
+    não é exposta como parâmetro direto de propósito: o Plotly já deriva
+    ela do espaço sobrando depois do gap, e deixar as duas configuráveis
+    (largura fixa E gap) cria combinação que desalinha barra entre séries
+    -- mexer só no gap já cobre "quero barra mais grossa/mais fina" sem
+    esse risco.
 
     DUAS DECISÕES DE UX:
 
@@ -148,6 +159,8 @@ def _build_chart(
 
     layout = dict(
         barmode="group",
+        bargap=bargap,
+        bargroupgap=bargroupgap,
         title=title,
         legend=dict(
             title=legend_title, orientation="h",
@@ -289,6 +302,19 @@ def _render_cruzamento_tab(
             "tendência que não existe."
         ),
     )
+    bargap, bargroupgap = 0.2, 0.1
+    if chart_type in ("Barras", "Barra horizontal"):
+        col_gap1, col_gap2 = st.columns(2)
+        with col_gap1:
+            bargap = st.slider(
+                "Espaço entre grupos", 0.0, 0.9, 0.2, 0.05,
+                help="Maior = barras mais finas, mais espaço entre categorias do eixo.",
+            )
+        with col_gap2:
+            bargroupgap = st.slider(
+                "Espaço dentro do grupo", 0.0, 0.9, 0.1, 0.05,
+                help="Maior = mais separação entre as barras de um mesmo grupo (ex.: entre Ótimo/Bom/Regular lado a lado).",
+            )
     row_totals_weighted = blocks[0].cell_weighted["Total"]  # base ponderada de cada categoria do stub, pro %LINHA
     for b in blocks[1:]:  # blocks[0] é sempre "Total" -- não faz gráfico próprio, já está implícito em cada um dos outros
         # %LINHA: "como esse grupo do stub se distribui nessa pergunta" --
@@ -308,6 +334,7 @@ def _render_cruzamento_tab(
                 legend_title=b.banner_label,
                 category_label=options[stub_key],
                 value_context="desse grupo",
+                bargap=bargap, bargroupgap=bargroupgap,
             )
             st.plotly_chart(fig1, width='stretch')
             st.caption("Como cada grupo se distribui nessa pergunta — compare grupos entre si.")
@@ -320,6 +347,7 @@ def _render_cruzamento_tab(
                 legend_title=b.banner_label,
                 category_label=options[stub_key],
                 value_context="de quem respondeu isso",
+                bargap=bargap, bargroupgap=bargroupgap,
             )
             st.plotly_chart(fig2, width='stretch')
             st.caption("Quem compõe cada resposta — o perfil de quem escolheu cada opção.")

@@ -54,7 +54,7 @@ from crosstab_engine import (
     table_to_excel_bytes,
 )
 from indices import compute_index_trend, compute_quadrant_data, indicator_media_map
-from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels
+from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels, sort_categories
 
 st.set_page_config(page_title="Gerador de Banner", layout="wide")
 
@@ -625,6 +625,38 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
 #  DADOS ORIGINAIS
 # ══════════════════════════════════════════════════════════════════════
 
+_INDICATOR_BIN_EDGES = [-float("inf"), 1.5, 2.5, 3.5, 4.5, float("inf")]
+_INDICATOR_BIN_LABELS = [
+    "Média 1 (<=1,4)", "Média 2 (>=1,5)", "Média 3 (>=2,5)",
+    "Média 4 (>=3,5)", "Média 5 (>=4,5)",
+]
+
+
+def _categorical_counts(series: pd.Series) -> pd.Series:
+    """Contagem bruta por categoria, ordenada pra leitura (não alfabética), com nulo como mais uma linha."""
+    counts = series.value_counts(dropna=True)
+    counts = counts.reindex(sort_categories(list(counts.index)))
+    counts["(nulo)"] = int(series.isna().sum())
+    return counts
+
+
+def _binned_media_counts(series: pd.Series) -> pd.Series:
+    """
+    Contagem bruta por faixa de um companion `_media`, nos MESMOS cortes
+    que geram a categórica `_c` irmã (<1,5 / 1,5-2,5 / 2,5-3,5 / 3,5-4,5
+    / >=4,5) -- não é um corte novo, é o que o dado já usa. Serve de
+    auditoria cruzada: comparado com `_categorical_counts` da
+    categórica irmã, os números têm que bater linha a linha -- foi
+    assim que o bug do ISDE apareceu (categórica com distribuição real,
+    média 100% nula).
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+    binned = pd.cut(numeric, bins=_INDICATOR_BIN_EDGES, labels=_INDICATOR_BIN_LABELS, right=False)
+    counts = binned.value_counts(dropna=True).reindex(_INDICATOR_BIN_LABELS, fill_value=0)
+    counts["(nulo)"] = int(numeric.isna().sum())
+    return counts
+
+
 def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame) -> None:
     """
     Aba de DIAGNÓSTICO de dados brutos -- não é visualização, é "como
@@ -665,6 +697,27 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
     nulos = subset.isnull().sum().rename("nulos")
     nulos_pct = (subset.isnull().mean() * 100).round(1).rename("nulos_%")
     st.dataframe(pd.concat([nulos, nulos_pct], axis=1), width='stretch')
+
+    st.markdown("**Distribuição por coluna** (contagem bruta, não ponderada)")
+    for col in colunas:
+        m = meta.get(col)
+        with st.expander(f"{col} — {label_por_coluna[col]}"):
+            if m is not None and m.var_type == VarType.SCALE_MEDIA:
+                st.dataframe(_binned_media_counts(base[col]).rename("contagem").to_frame(), width='stretch')
+                sibling = m.scale_base
+                if sibling and sibling in base.columns and sibling in meta and meta[sibling].var_type == VarType.INDICATOR:
+                    st.caption(
+                        f"Comparação com a categórica irmã '{sibling}' -- as faixas têm que bater linha a "
+                        f"linha com as categorias 'Média próxima ou igual a N' abaixo, e '(nulo)' aqui "
+                        f"corresponde à categoria 'N/A - ...' lá (são o mesmo grupo de gente, contado de "
+                        f"dois jeitos diferentes). Se não bater, é sinal de inconsistência -- foi assim "
+                        f"que o problema do ISDE apareceu."
+                    )
+                    st.dataframe(_categorical_counts(base[sibling]).rename(sibling).to_frame(), width='stretch')
+            elif m is not None and m.var_type in (VarType.SR, VarType.MR_OPTION, VarType.INDICATOR):
+                st.dataframe(_categorical_counts(base[col]).rename("contagem").to_frame(), width='stretch')
+            else:
+                st.caption("Coluna numérica sem indicador associado -- sem faixa aqui, só o describe() acima.")
 
     st.markdown("**Linhas duplicadas** (considerando só as colunas escolhidas acima)")
     st.write(f"{int(subset.duplicated().sum())} de {len(subset)} linhas")

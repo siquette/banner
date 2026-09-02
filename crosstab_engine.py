@@ -530,6 +530,21 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     return table
 
 
+def _format_br_number(value: float, decimals: int) -> str:
+    """
+    Formata número no padrão pt-BR (milhar com ".", decimal com ",").
+
+    CSV é texto puro -- sem metadado de formato, então o separador tem
+    que ser fabricado na mão aqui (diferente do .xlsx, onde o Excel lê o
+    código de formato e escolhe o separador certo sozinho, ver
+    `table_to_excel_bytes`). Faz a troca em duas etapas com um caractere
+    de rascunho (`\\x00`, nunca aparece em número formatado) porque trocar
+    "," por "." direto sobrescreveria o "." que "," vira em seguida.
+    """
+    text = f"{value:,.{decimals}f}"  # ex.: "1,234.5" (padrão EUA de saída do Python)
+    return text.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
 def format_table_for_export(table: pd.DataFrame) -> pd.DataFrame:
     """
     Versão em texto de `format_banner_table_full`, pra exportar em CSV.
@@ -544,12 +559,163 @@ def format_table_for_export(table: pd.DataFrame) -> pd.DataFrame:
     (inteiro pra NA, 1 casa decimal pro resto) vira texto de verdade
     antes de gerar o CSV, pra o arquivo exportado bater com o que a tela
     mostra.
+
+    Números no padrão pt-BR (milhar "." / decimal ",") -- o público daqui
+    lê número em pt-BR, e usar vírgula-de-milhar estilo EUA
+    (`f"{v:,.0f}"` puro) confundia quem abria o CSV rápido, achando que
+    "1,234" era "1,234" decimal em vez de mil e duzentos e trinta e
+    quatro.
     """
     out = table.copy().astype(object)
     na_rows = table.index.get_level_values(1) == "NA"
-    out.loc[na_rows] = table.loc[na_rows].map(lambda v: f"{v:,.0f}")
-    out.loc[~na_rows] = table.loc[~na_rows].map(lambda v: f"{v:.1f}")
+    out.loc[na_rows] = table.loc[na_rows].map(lambda v: _format_br_number(v, 0))
+    out.loc[~na_rows] = table.loc[~na_rows].map(lambda v: _format_br_number(v, 1))
     return out
+
+
+def table_to_excel_bytes(
+    df: pd.DataFrame,
+    *,
+    sheet_name: str = "Dados",
+    default_format: str = "#,##0.00",
+    column_formats: dict[str, str] | None = None,
+) -> bytes:
+    """
+    Serializa um DataFrame "achatado" (índice e colunas de 1 nível só,
+    ex.: a tabela de "Visão geral" ou "Índice individual" de indices.py)
+    pra bytes de .xlsx, com número de verdade em cada célula.
+
+    Ao contrário do CSV (`format_table_for_export`), aqui NÃO se fabrica
+    texto com separador pt-BR na mão: o código de formato do Excel
+    ("#,##0.00") é sintaxe universal -- são placeholders de posição de
+    milhar/decimal, não caracteres literais -- e o Excel escolhe "," ou
+    "." de verdade a partir da configuração regional de quem abre o
+    arquivo. Escrever texto pré-formatado seria pior aqui: a pessoa
+    perderia a possibilidade de somar, filtrar ou fazer gráfico em cima
+    da coluna dentro do próprio Excel.
+
+    `column_formats`: código de formato por nome de coluna, pra tabelas
+    com colunas de precisão diferente (ex.: "Média" com 2 casas, "N"
+    como inteiro) -- coluna fora do dict cai em `default_format`.
+    """
+    import io
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+
+    column_formats = column_formats or {}
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31]  # limite de 31 caracteres do Excel pro nome da aba
+
+    bold = Font(bold=True)
+    ws.cell(row=1, column=1, value=df.index.name or "")
+    for j, col_name in enumerate(df.columns):
+        cell = ws.cell(row=1, column=j + 2, value=str(col_name))
+        cell.font = bold
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, (idx, row) in enumerate(df.iterrows()):
+        ws.cell(row=i + 2, column=1, value=str(idx)).font = bold
+        for j, col_name in enumerate(df.columns):
+            val = row[col_name]
+            if pd.notna(val):
+                cell = ws.cell(row=i + 2, column=j + 2, value=float(val))
+                cell.number_format = column_formats.get(col_name, default_format)
+
+    ws.freeze_panes = "B2"
+    ws.column_dimensions["A"].width = 42
+    for j in range(len(df.columns)):
+        ws.column_dimensions[get_column_letter(j + 2)].width = 16
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def banner_table_to_excel_bytes(table: pd.DataFrame, mask: pd.DataFrame | None = None) -> bytes:
+    """
+    Serializa o banner completo (índice de 2 níveis -- categoria do stub
+    + métrica NA/%LINHA/%COLUNA; coluna de 2 níveis -- bloco de banner +
+    categoria) pra bytes de .xlsx, reconstruindo o cabeçalho mesclado que
+    o Streamlit mostra na tela.
+
+    Número de verdade em cada célula (ver `table_to_excel_bytes` pro
+    porquê disso importar mais aqui do que no CSV).
+
+    `mask`: mesmo formato de `small_n_mask_full` -- pinta de amarelo a
+    célula cuja base está abaixo do limiar, espelhando o destaque que já
+    existe em `_highlight_small_n` na tela. Opcional: sem `mask`, exporta
+    sem cor nenhuma.
+    """
+    import io
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Banner"
+
+    n_index_cols = 2
+    header_row1, header_row2, data_start = 1, 2, 3
+
+    bold = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="DDDDDD")
+    small_n_fill = PatternFill("solid", fgColor="FFF3CD")
+
+    ws.cell(row=header_row2, column=1, value="Categoria").font = bold
+    ws.cell(row=header_row2, column=2, value="Métrica").font = bold
+
+    # linha 1 mescla o rótulo do bloco de banner (ex.: "Total", "ANO");
+    # linha 2 tem a categoria dentro do bloco (ex.: "2023", "2024")
+    current_label, span_start = None, n_index_cols + 1
+    for i, (label, cat) in enumerate(table.columns):
+        c = n_index_cols + 1 + i
+        cell = ws.cell(row=header_row2, column=c, value=str(cat))
+        cell.font = bold
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        if label != current_label:
+            if current_label is not None:
+                ws.merge_cells(start_row=header_row1, start_column=span_start, end_row=header_row1, end_column=c - 1)
+            ws.cell(row=header_row1, column=span_start, value=str(label)).font = bold
+            ws.cell(row=header_row1, column=span_start).alignment = Alignment(horizontal="center")
+            current_label, span_start = label, c
+    last_col = n_index_cols + len(table.columns)
+    ws.merge_cells(start_row=header_row1, start_column=span_start, end_row=header_row1, end_column=last_col)
+
+    int_fmt, dec_fmt = "#,##0", "#,##0.0"
+
+    row_start_by_cat: dict = {}
+    for r, ((cat, metric), row_values) in enumerate(table.iterrows()):
+        excel_row = data_start + r
+        row_start_by_cat.setdefault(cat, excel_row)
+        ws.cell(row=excel_row, column=2, value=metric)
+        fmt = int_fmt if metric == "NA" else dec_fmt
+        for c, (col_key, val) in enumerate(zip(table.columns, row_values)):
+            cell = ws.cell(row=excel_row, column=n_index_cols + 1 + c, value=float(val))
+            cell.number_format = fmt
+            if mask is not None and bool(mask.loc[(cat, metric), col_key]):
+                cell.fill = small_n_fill
+
+    # mescla a coluna "Categoria" nas 3 linhas (NA/%LINHA/%COLUNA) de
+    # cada categoria do stub, igual ao efeito visual da tela
+    for cat, first_row in row_start_by_cat.items():
+        ws.cell(row=first_row, column=1, value=str(cat)).font = bold
+        ws.merge_cells(start_row=first_row, start_column=1, end_row=first_row + 2, end_column=1)
+
+    ws.freeze_panes = ws.cell(row=data_start, column=n_index_cols + 1).coordinate
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 10
+    for c in range(n_index_cols + 1, last_col + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 14
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def small_n_mask_full(blocks: list[BannerBlock]) -> pd.DataFrame:

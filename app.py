@@ -44,12 +44,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from crosstab_engine import (
+    banner_table_to_excel_bytes,
     build_banner,
     format_banner_table_full,
     format_table_for_export,
     get_column_series,
     get_weights,
     small_n_mask_full,
+    table_to_excel_bytes,
 )
 from indices import compute_index_trend, compute_quadrant_data, indicator_media_map
 from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels
@@ -352,12 +354,23 @@ def _render_cruzamento_tab(
             st.plotly_chart(fig2, width='stretch')
             st.caption("Quem compõe cada resposta — o perfil de quem escolheu cada opção.")
 
-    st.download_button(
-        "Baixar banner (CSV)",
-        data=format_table_for_export(table).to_csv().encode("utf-8"),
-        file_name="banner.csv",
-        mime="text/csv",
-    )
+    col_csv, col_xlsx = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "Baixar banner (CSV)",
+            data=format_table_for_export(table).to_csv().encode("utf-8"),
+            file_name="banner.csv",
+            mime="text/csv",
+            key="download_banner_csv",
+        )
+    with col_xlsx:
+        st.download_button(
+            "Baixar banner (Excel)",
+            data=banner_table_to_excel_bytes(table, mask),
+            file_name="banner.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_banner_xlsx",
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -368,8 +381,51 @@ def _render_cruzamento_tab(
 # separadas fica mais fácil achar/mudar uma visão sem reler as outras
 # duas.
 
+def _indices_overview_table(filtered_data, meta, indicator_names, media_map, segment_key, weights) -> pd.DataFrame:
+    """
+    Uma linha por índice, uma coluna por categoria do segmento, valor =
+    média ponderada -- o mesmo dado do gráfico de "Visão geral", só que em
+    grade em vez de linha, pra quem quer o número exato de cada célula
+    sem precisar passar o mouse em cada ponto.
+    """
+    rows = {}
+    for ind in indicator_names:
+        media_col = media_map.get(ind)
+        if not media_col:
+            continue
+        trend = compute_index_trend(filtered_data, meta, media_col, segment_key, weights)
+        rows[meta[ind].label] = trend["media"]
+    return pd.DataFrame(rows).T
+
+
 def _render_indices_overview(filtered_data, meta, options, indicator_names, media_map, segment_key, weights) -> None:
-    """Linha de tendência de TODOS os índices juntos, mesma escala 1-5 -- visão de "painel de saúde"."""
+    """Todos os índices juntos, mesma escala 1-5 -- alternável entre linha de tendência ("painel de saúde") e tabela de médias."""
+    view = st.radio("Mostrar como", ["Gráfico", "Tabela"], horizontal=True, key="indices_overview_view")
+
+    table = _indices_overview_table(filtered_data, meta, indicator_names, media_map, segment_key, weights)
+    col_csv, col_xlsx = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "Baixar índices (CSV)",
+            data=table.to_csv().encode("utf-8"),
+            file_name=f"indices_por_{segment_key}.csv",
+            mime="text/csv",
+            key="download_indices_overview_csv",
+        )
+    with col_xlsx:
+        st.download_button(
+            "Baixar índices (Excel)",
+            data=table_to_excel_bytes(table, sheet_name="Índices", default_format="#,##0.00"),
+            file_name=f"indices_por_{segment_key}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_indices_overview_xlsx",
+        )
+
+    if view == "Tabela":
+        st.dataframe(table.style.format("{:.2f}", na_rep="—"), width='stretch')
+        st.caption("Média ponderada (escala 1-5) por índice e categoria de " + options[segment_key] + ". '—' = sem dado suficiente nessa categoria.")
+        return
+
     fig = go.Figure()
     for ind in indicator_names:
         media_col = media_map.get(ind)
@@ -419,6 +475,26 @@ def _render_indices_individual(filtered_data, meta, options, indicator_names, me
         display.style.format({"Média": "{:.2f}", "Cobertura %": "{:.1f}", "N": "{:,.0f}"}),
         width='stretch',
     )
+    col_csv, col_xlsx = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "Baixar (CSV)",
+            data=display.to_csv().encode("utf-8"),
+            file_name=f"{selected}_por_{segment_key}.csv",
+            mime="text/csv",
+            key="download_indice_individual_csv",
+        )
+    with col_xlsx:
+        st.download_button(
+            "Baixar (Excel)",
+            data=table_to_excel_bytes(
+                display, sheet_name=selected,
+                column_formats={"Média": "#,##0.00", "Cobertura %": "#,##0.0", "N": "#,##0"},
+            ),
+            file_name=f"{selected}_por_{segment_key}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_indice_individual_xlsx",
+        )
 
 
 def _render_indices_quadrant(filtered_data, meta, indicator_names, media_map, segment_key, weights) -> None:

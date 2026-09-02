@@ -579,8 +579,8 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
     `_render_indices_overview`/`_individual`/`_quadrant` conforme
     escolhido.
     """
-    indicator_names = [m.name for m in meta.values() if m.var_type == VarType.INDICATOR]
     media_map = indicator_media_map(meta)
+    indicator_names = list(media_map.keys())
     if not indicator_names or not media_map:
         st.info("Esse banco não tem variáveis de indicador (_c) com companion numérico (_media).")
         return
@@ -619,6 +619,60 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
         _render_indices_individual(filtered_data, meta, options, indicator_names, media_map, segment_key, weights)
     else:  # Quadrante
         _render_indices_quadrant(filtered_data, meta, indicator_names, media_map, segment_key, weights)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DADOS ORIGINAIS
+# ══════════════════════════════════════════════════════════════════════
+
+def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame) -> None:
+    """
+    Visualizador de dados brutos -- linha = respondente, coluna =
+    pergunta, sem cruzamento nenhum. Serve pra conferir manualmente o
+    que uma variável específica tem (ex.: olhar `ISDE_media` pessoa por
+    pessoa) sem precisar sair do app.
+
+    Não usa `crossable_variables`/`options` de propósito -- aquela lista
+    exclui WEIGHT/IDENTIFIER/SCALE_MEDIA porque não fazem sentido como
+    stub/banner (ver metadata.py), mas fazem TODO sentido aqui: é
+    justamente o companion `_media` (SCALE_MEDIA) que mais precisa ser
+    inspecionado linha a linha ao investigar um índice.
+
+    RAM é limitada (Streamlit Community Cloud, 1GB -- ver README) e o
+    banco de produção tem 100k+ linhas x 1000+ colunas -- por isso nada
+    aqui carrega sozinho: a pessoa escolhe coluna e quantidade de linha
+    antes de qualquer render, os dois vêm vazios/baixos por padrão.
+    """
+    st.subheader("Dados originais")
+
+    usar_filtro = st.checkbox(
+        "Aplicar o filtro de base da barra lateral", value=True,
+        help="Desmarque pra ver a base completa, ignorando o filtro em '1. Filtro de base'.",
+    )
+    base = filtered_data if usar_filtro else data
+    st.caption(f"{len(base)} respondentes disponíveis nessa visão · {len(base.columns)} colunas no total.")
+
+    label_por_coluna = {c: (meta[c].label if c in meta else c) for c in base.columns}
+    colunas = st.multiselect(
+        "Colunas pra mostrar",
+        options=list(base.columns),
+        format_func=lambda c: f"{c} — {label_por_coluna[c]}" if label_por_coluna[c] != c else c,
+        help="Digite pra buscar por código (ex.: ISDE_media) ou por texto da pergunta -- os dois entram na busca.",
+    )
+
+    if not colunas:
+        st.info("Escolha ao menos uma coluna acima pra ver os dados.")
+        return
+
+    n_linhas = st.number_input(
+        "Quantas linhas mostrar",
+        min_value=1, max_value=max(1, min(len(base), 5000)), value=max(1, min(100, len(base))), step=50,
+        help="Limitado de propósito -- mostrar as 100k+ linhas de uma vez pode estourar a memória do app.",
+    )
+    if len(colunas) > 50 and n_linhas > 1000:
+        st.warning("Muita coluna + muita linha junto pode deixar o app lento -- reduza um dos dois se travar.")
+
+    st.dataframe(base[colunas].head(int(n_linhas)), width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -734,11 +788,13 @@ def main() -> None:
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
 
-    tab_cruzamento, tab_indices = st.tabs(["📊 Cruzamento", "📈 Índices"])
+    tab_cruzamento, tab_indices, tab_dados = st.tabs(["📊 Cruzamento", "📈 Índices", "🗂️ Dados originais"])
     with tab_cruzamento:
         _render_cruzamento_tab(data, meta, options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters)
     with tab_indices:
         _render_indices_tab(data, meta, options, filtered_data)
+    with tab_dados:
+        _render_dados_tab(data, meta, filtered_data)
 
 
 if __name__ == "__main__":

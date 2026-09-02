@@ -627,52 +627,59 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
 
 def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame) -> None:
     """
-    Visualizador de dados brutos -- linha = respondente, coluna =
-    pergunta, sem cruzamento nenhum. Serve pra conferir manualmente o
-    que uma variável específica tem (ex.: olhar `ISDE_media` pessoa por
-    pessoa) sem precisar sair do app.
+    Aba de DIAGNÓSTICO de dados brutos -- não é visualização, é "como
+    estão os dados": nulo por coluna, linha duplicada, describe. Existe
+    pra achar problema tipo o do ISDE (companion `_media` vazio apesar
+    da categórica ter valor real) direto na tela, sem sair do app pra
+    rodar script. Temporária de propósito -- por isso sem estilo, só a
+    conta.
 
-    Não usa `crossable_variables`/`options` de propósito -- aquela lista
-    exclui WEIGHT/IDENTIFIER/SCALE_MEDIA porque não fazem sentido como
-    stub/banner (ver metadata.py), mas fazem TODO sentido aqui: é
-    justamente o companion `_media` (SCALE_MEDIA) que mais precisa ser
-    inspecionado linha a linha ao investigar um índice.
-
-    RAM é limitada (Streamlit Community Cloud, 1GB -- ver README) e o
-    banco de produção tem 100k+ linhas x 1000+ colunas -- por isso nada
-    aqui carrega sozinho: a pessoa escolhe coluna e quantidade de linha
-    antes de qualquer render, os dois vêm vazios/baixos por padrão.
+    Não usa `crossable_variables`/`options` pelo mesmo motivo da versão
+    anterior desta aba: aquela lista some com WEIGHT/IDENTIFIER/
+    SCALE_MEDIA, e é justamente o companion `_media` que mais precisa
+    ser diagnosticado.
     """
-    st.subheader("Dados originais")
+    st.subheader("Diagnóstico de dados")
 
     usar_filtro = st.checkbox(
         "Aplicar o filtro de base da barra lateral", value=True,
-        help="Desmarque pra ver a base completa, ignorando o filtro em '1. Filtro de base'.",
+        help="Desmarque pra diagnosticar a base completa, ignorando o filtro em '1. Filtro de base'.",
     )
     base = filtered_data if usar_filtro else data
     st.caption(f"{len(base)} respondentes disponíveis nessa visão · {len(base.columns)} colunas no total.")
 
     label_por_coluna = {c: (meta[c].label if c in meta else c) for c in base.columns}
     colunas = st.multiselect(
-        "Colunas pra mostrar",
+        "Colunas pra diagnosticar",
         options=list(base.columns),
         format_func=lambda c: f"{c} — {label_por_coluna[c]}" if label_por_coluna[c] != c else c,
-        help="Digite pra buscar por código (ex.: ISDE_media) ou por texto da pergunta -- os dois entram na busca.",
+        help="Digite pra buscar por código (ex.: ISDE_media) ou por texto da pergunta.",
     )
-
     if not colunas:
-        st.info("Escolha ao menos uma coluna acima pra ver os dados.")
+        st.info("Escolha ao menos uma coluna acima -- ex.: uma categórica (`ISDE`) e sua `_media` companion juntas, pra comparar direto.")
         return
 
-    n_linhas = st.number_input(
-        "Quantas linhas mostrar",
-        min_value=1, max_value=max(1, min(len(base), 5000)), value=max(1, min(100, len(base))), step=50,
-        help="Limitado de propósito -- mostrar as 100k+ linhas de uma vez pode estourar a memória do app.",
-    )
-    if len(colunas) > 50 and n_linhas > 1000:
-        st.warning("Muita coluna + muita linha junto pode deixar o app lento -- reduza um dos dois se travar.")
+    subset = base[colunas]
 
-    st.dataframe(base[colunas].head(int(n_linhas)), width='stretch')
+    st.markdown("**Nulos por coluna**")
+    nulos = subset.isnull().sum().rename("nulos")
+    nulos_pct = (subset.isnull().mean() * 100).round(1).rename("nulos_%")
+    st.dataframe(pd.concat([nulos, nulos_pct], axis=1), width='stretch')
+
+    st.markdown("**Linhas duplicadas** (considerando só as colunas escolhidas acima)")
+    st.write(f"{int(subset.duplicated().sum())} de {len(subset)} linhas")
+    st.caption("Poucas colunas categóricas naturalmente geram muita 'duplicata' -- isso não é bug sozinho, é combinação de categoria se repetindo. Só desconfie se escolher colunas suficientes pra cada linha ser praticamente única (ex.: incluindo um ID).")
+
+    st.markdown("**describe()**")
+    st.dataframe(subset.describe(include="all").T, width='stretch')
+
+    with st.expander("Ver linhas cruas (opcional)"):
+        n_linhas = st.number_input(
+            "Quantas linhas mostrar",
+            min_value=1, max_value=max(1, min(len(base), 5000)), value=max(1, min(100, len(base))), step=50,
+            help="Limitado de propósito -- mostrar as 100k+ linhas de uma vez pode estourar a memória do app.",
+        )
+        st.dataframe(subset.head(int(n_linhas)), width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -788,7 +795,7 @@ def main() -> None:
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
 
-    tab_cruzamento, tab_indices, tab_dados = st.tabs(["📊 Cruzamento", "📈 Índices", "🗂️ Dados originais"])
+    tab_cruzamento, tab_indices, tab_dados = st.tabs(["📊 Cruzamento", "📈 Índices", "🩺 Diagnóstico de dados"])
     with tab_cruzamento:
         _render_cruzamento_tab(data, meta, options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters)
     with tab_indices:

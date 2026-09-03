@@ -15,7 +15,8 @@ TRÊS CÁLCULOS, TRÊS PROPÓSITOS
 ---------------------------------
 - `compute_index_trend`: um índice, segmentado (ex.: por ANO) -- usado na
   visão "Índice individual" e como base do quadrante "Tendência x Nível".
-- `compute_quadrant_data`: os 14 índices de uma vez, resumidos em nível +
+- `compute_quadrant_data`: os índices de uma vez (15, com IAG/ISDE via
+  `_MEDIA_ALIASES`), resumidos em nível +
   tendência + importância -- usado nas duas visões de quadrante.
 - `_weighted_corr`: a peça de "importância" -- correlação ponderada entre
   dois índices, pessoa por pessoa (não é causa, é "importância derivada",
@@ -35,24 +36,94 @@ from metadata import VariableMeta, VarType
 #  MAPEAMENTO ÍNDICE -> COMPANION NUMÉRICO
 # ══════════════════════════════════════════════════════════════════════
 
+_MEDIA_ALIASES: dict[str, str] = {
+    "IAG": "P46_media",
+    "ISDE": "P23_media",
+}
+"""
+Exceções confirmadas ao pareamento automático por nome (`scale_base`
+== nome do indicador). Os dois casos aqui são perguntas ÚNICAS (P46,
+P23) cujo indicador tem um "apelido" (IAG, ISDE) que não bate com o
+código da pergunta de origem -- diferente dos outros 12 índices, que
+são compostos de várias perguntas e nascem com `_c`/`_media` já
+consistentes entre si.
+
+Confirmado célula a célula contra o banco (não só por classificação de
+coluna): `P46_media` bate 100% com o mapeamento ÓTIMO=5.../PÉSSIMO=1
+da categórica `IAG`; `P23_media` bate 100% com os buckets da
+categórica `ISDE`. As colunas "óbvias" (`IAG_media` -- nem existe;
+`ISDE_media` -- existe mas 100% vazia) NÃO são a fonte real.
+
+IAG nem chega a ser classificado como INDICATOR (o rótulo completo não
+termina em "_c" -- é a pergunta P46 crua, sem o prefixo "INDICADOR DE
+..."), por isso entra aqui incondicionalmente, não só como override de
+um pareamento que já existia.
+"""
+
+
 def indicator_media_map(meta: dict[str, VariableMeta]) -> dict[str, str]:
     """
     Nome do indicador (ex.: "IACOM") -> nome da sua coluna `_media`
     companion (ex.: "IACOM_media"), via `scale_base` -- mapeamento exato,
     não substring (uma tentativa anterior por substring confundia "IM"
     com "IMC_media", já que "IM" é prefixo de "IMC").
+
+    `_MEDIA_ALIASES` entra por cima do pareamento automático -- cobre o
+    caso de indicador cujo companion numérico tem nome de pergunta, não
+    nome de índice (ver docstring de `_MEDIA_ALIASES`).
     """
     media_by_base = {m.scale_base: m.name for m in meta.values() if m.var_type == VarType.SCALE_MEDIA}
-    return {
+    mapping = {
         m.name: media_by_base[m.name]
         for m in meta.values()
         if m.var_type == VarType.INDICATOR and m.name in media_by_base
     }
+    for indicator, media_col in _MEDIA_ALIASES.items():
+        if media_col in meta:  # defensivo: nunca aponta pra coluna que não existe no banco carregado
+            mapping[indicator] = media_col
+    return mapping
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  TENDÊNCIA DE UM ÍNDICE
 # ══════════════════════════════════════════════════════════════════════
+
+_NEUTRAL_IMPUTATION: dict[str, float] = {
+    "IACOM_media": 3.0,
+}
+"""
+Índice em que ausência de resposta é neutro por definição, não "sem
+dado". Confirmado com o Ro: no IACOM, quem não teve contato com a
+comunicação da empresa entra na média como nota 3 (ponto médio da
+escala 1-5) em vez de ser excluído -- o universo do índice é todo
+mundo, não só quem foi exposto.
+
+Só o IACOM até agora. IAA/IAC/IAD/IAPS têm o mesmíssimo padrão de N/A
+na categórica (ver auditoria anterior), mas cada um precisa ser
+confirmado antes de entrar aqui -- aplicar essa regra errado muda
+número reportado pro cliente, e "parece o mesmo padrão" não é
+confirmação.
+"""
+
+
+def _media_values(data: pd.DataFrame, media_col: str) -> pd.Series:
+    """
+    Lê o companion `_media` já convertido pra número, com a imputação
+    de `_NEUTRAL_IMPUTATION` aplicada quando for o caso. Ponto único de
+    leitura -- usado tanto por `compute_index_trend` (nível/tendência)
+    quanto por `compute_quadrant_data` (importância/correlação), pra
+    "o valor de um respondente nesse índice" nunca divergir entre as
+    duas contas. A alternativa -- imputar só na tendência e deixar a
+    correlação sem imputar -- deixaria o mesmo índice com dois
+    "universos" diferentes dependendo de qual gráfico se olha, o que é
+    mais confuso do que qualquer ganho de pureza estatística na
+    correlação.
+    """
+    value = pd.to_numeric(get_column_series(data, media_col), errors="coerce")
+    if media_col in _NEUTRAL_IMPUTATION:
+        value = value.fillna(_NEUTRAL_IMPUTATION[media_col])
+    return value
+
 
 def compute_index_trend(
     data: pd.DataFrame,
@@ -78,7 +149,7 @@ def compute_index_trend(
     if seg_meta.var_type != VarType.SR:
         raise ValueError(f"'{segment_key}' não é resposta única -- segmentação de índice só suporta SR.")
 
-    value = pd.to_numeric(get_column_series(data, media_col), errors="coerce")
+    value = _media_values(data, media_col)
     segment = get_column_series(data, seg_meta.name)
 
     df = pd.DataFrame({"value": value, "segment": segment, "weight": weights})
@@ -168,10 +239,7 @@ def compute_quadrant_data(
     (`app.py`) decidir se filtra antes de plotar.
     """
     reference_col = media_map.get(reference_indicator)
-    reference_values = (
-        pd.to_numeric(get_column_series(data, reference_col), errors="coerce")
-        if reference_col else None
-    )
+    reference_values = _media_values(data, reference_col) if reference_col else None
 
     waves_sorted: list = []
     if wave_key in meta and meta[wave_key].var_type == VarType.SR:
@@ -180,7 +248,7 @@ def compute_quadrant_data(
 
     rows = []
     for ind, media_col in media_map.items():
-        values = pd.to_numeric(get_column_series(data, media_col), errors="coerce")
+        values = _media_values(data, media_col)
 
         level, trend, n, coverage_pct = float("nan"), float("nan"), 0, 0.0
         if len(waves_sorted) >= 1:

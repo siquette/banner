@@ -657,6 +657,68 @@ def _binned_media_counts(series: pd.Series) -> pd.Series:
     return counts
 
 
+_DEMOGRAFIA_MEDIA: dict[str, str] = {
+    "F1_media": "Idade",
+    "P50_media": "Nº de moradores",
+    "P50.1_media": "Nº de crianças",
+}
+"""
+Companions `_media` que são demografia, não índice de satisfação --
+mesmo padrão de nome (`_media`, dtype numérico) dos 15 índices, mas em
+escala completamente diferente (idade vai de ~18 a ~90, não de 1 a 5).
+Descobertos vasculhando as 128 colunas `_media` do banco -- só 15 
+viram índice oficial, o resto são sub-itens ou perguntas soltas como
+essas 3. Ficam fora de `indicator_media_map`/`_binned_media_counts` de
+propósito (o binning de 1 a 5 não faz sentido pra idade), e entram
+aqui como lista separada, com rótulo pra exibição em vez do nome cru.
+"""
+
+
+def _render_boxplot_secao(base: pd.DataFrame, meta: dict) -> None:
+    """
+    Boxplot dos 15 índices (mesma escala 1-5, todos no mesmo eixo, pra
+    comparar direto) + 3 variáveis demográficas (escalas diferentes
+    entre si -- cada uma no seu próprio gráfico).
+
+    Bruto, não ponderado -- mesma filosofia do resto da aba: aqui o
+    objetivo é ver o dado como ele é, não a estimativa populacional.
+
+    `boxmean=True` desenha a média como linha tracejada dentro da
+    caixa, ao lado da mediana que o boxplot já desenha sozinho -- a
+    distância entre as duas é o sinal de que a média está sendo puxada
+    por uma cauda (assimetria), sem precisar ler número nenhum.
+
+    Eixo Y dos índices NÃO é travado em [1, 5] de propósito: se algum
+    valor tiver escapado da escala -- o tipo de bug que já apareceu no
+    ISDE -- ele precisa ficar visível no gráfico, não cortado fora.
+    """
+    st.markdown("### Boxplot — índices e demografia")
+
+    st.markdown("**Índices** (escala 1-5, todos no mesmo eixo pra comparar)")
+    media_map = indicator_media_map(meta)
+    fig = go.Figure()
+    for ind, media_col in sorted(media_map.items()):
+        if media_col not in base.columns:
+            continue
+        values = pd.to_numeric(base[media_col], errors="coerce").dropna()
+        fig.add_trace(go.Box(y=values, name=ind, boxmean=True))
+    fig.update_layout(showlegend=False, yaxis_title="Nota (1-5)", height=450)
+    st.plotly_chart(fig, width='stretch')
+
+    st.markdown("**Demografia** (escalas diferentes entre si -- um gráfico por variável)")
+    cols = st.columns(len(_DEMOGRAFIA_MEDIA))
+    for col_widget, (col_name, label) in zip(cols, _DEMOGRAFIA_MEDIA.items()):
+        with col_widget:
+            if col_name not in base.columns:
+                st.caption(f"{col_name} não existe nesse banco.")
+                continue
+            values = pd.to_numeric(base[col_name], errors="coerce").dropna()
+            fig_d = go.Figure()
+            fig_d.add_trace(go.Box(y=values, name=label, boxmean=True))
+            fig_d.update_layout(showlegend=False, height=400, title=label)
+            st.plotly_chart(fig_d, width='stretch')
+
+
 def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame) -> None:
     """
     Aba de DIAGNÓSTICO de dados brutos -- não é visualização, é "como
@@ -725,6 +787,8 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
 
     st.markdown("**describe()**")
     st.dataframe(subset.describe(include="all").T, width='stretch')
+
+    _render_boxplot_secao(base, meta)
 
     with st.expander("Ver linhas cruas (opcional)"):
         n_linhas = st.number_input(

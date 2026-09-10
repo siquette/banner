@@ -827,16 +827,42 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
             ),
         )
 
+        if filter_keys:
+            st.caption(
+                "Filtros em cascata: cada um abaixo já considera só as linhas que "
+                "sobraram do filtro anterior, na ordem em que aparecem aqui."
+            )
+
         active_filters: dict[str, list[str]] = {}
+        cascading_data = data  # encolhe a cada iteração -- é o que faz a cascata funcionar
         for fk in filter_keys:
             fmeta = meta.get(fk)
             if fmeta is None or fmeta.var_type not in (VarType.SR, VarType.INDICATOR):
                 st.warning(f"'{options[fk]}' é múltipla resposta -- filtro ignorado nessa versão.")
                 continue
-            col = get_column_series(data, fmeta.name)
+            col = get_column_series(cascading_data, fmeta.name)
             available = sorted(v for v in col.dropna().unique().tolist())
-            chosen = st.multiselect(f"Manter em '{options[fk]}'", options=available, default=available, key=f"filter_{fk}")
+
+            prev_key = f"filter_{fk}"
+            prev_choice = st.session_state.get(prev_key)
+            # Streamlit descarta sozinho qualquer valor de `default`/estado anterior que não
+            # esteja mais em `options` -- mas faz isso em silêncio. Avisamos aqui pra não virar
+            # "por que minha seleção sumiu sozinha".
+            if prev_choice is not None:
+                dropped = [v for v in prev_choice if v not in available]
+                if dropped:
+                    st.caption(
+                        f"Em '{options[fk]}': {', '.join(str(v) for v in dropped)} não "
+                        f"sobrevive(m) ao(s) filtro(s) anterior(es) e foi(ram) removido(s) da seleção."
+                    )
+
+            chosen = st.multiselect(f"Manter em '{options[fk]}'", options=available, default=available, key=prev_key)
             active_filters[fk] = chosen
+
+            if not available:
+                st.warning(f"'{options[fk]}' não tem nenhum valor restante após os filtros anteriores.")
+                continue
+            cascading_data = cascading_data[col.isin(chosen)] if chosen else cascading_data.iloc[0:0]
 
         st.header("2. Cruzamento")
         stub_key = st.selectbox(
@@ -866,11 +892,10 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
             "Alertar células com base menor que", min_value=1, value=30, step=5
         )
 
-    filtered_data = data
-    for fk, chosen in active_filters.items():
-        fmeta = meta[fk]
-        col = get_column_series(filtered_data, fmeta.name)
-        filtered_data = filtered_data[col.isin(chosen)]
+    # `cascading_data` já é o resultado de aplicar todos os filtros em sequência
+    # (calculado dentro do loop acima, pro cascateamento de opções funcionar) --
+    # reusar em vez de refazer o corte do zero evita duas fontes de verdade.
+    filtered_data = cascading_data
 
     if active_filters:
         st.caption(f"Base após filtro: {len(filtered_data)} de {len(data)} respondentes.")

@@ -192,6 +192,7 @@ def _render_cruzamento_tab(
     na_handling: str,
     small_n_threshold: int,
     active_filters: dict,
+    use_weighting: bool,
 ) -> None:
     """
     Desenha a aba de cruzamento inteira: tabela NA/%LINHA/%COLUNA,
@@ -206,7 +207,7 @@ def _render_cruzamento_tab(
         st.warning("Selecione ao menos uma variável de banner na barra lateral.")
         return
 
-    blocks = build_banner(filtered_data, meta, stub_key, banner_keys, na_handling, small_n_threshold)
+    blocks = build_banner(filtered_data, meta, stub_key, banner_keys, na_handling, small_n_threshold, use_weighting)
     if not blocks:
         st.warning(
             "Nenhuma das variáveis de banner selecionadas tem respondente elegível "
@@ -220,10 +221,22 @@ def _render_cruzamento_tab(
     if active_filters:
         # Total sem filtro nenhum -- só pra comparação lado a lado com o
         # Total já filtrado que o resto da tabela usa. banner_keys=[] faz
-        # build_banner devolver só o bloco Total, sem cruzar nada.
-        unfiltered_blocks = build_banner(data, meta, stub_key, [], na_handling, small_n_threshold)
+        # build_banner devolver só o bloco Total, sem cruzar nada. Mesma
+        # `use_weighting` do lado filtrado -- as duas colunas precisam da
+        # mesma convenção, senão a comparação lado a lado mistura ponderado
+        # com não-ponderado silenciosamente.
+        unfiltered_blocks = build_banner(data, meta, stub_key, [], na_handling, small_n_threshold, use_weighting)
         unfiltered_table = format_banner_table_full(unfiltered_blocks)
         unfiltered_mask = small_n_mask_full(unfiltered_blocks)
+        # reindex pro índice de `table` (o lado FILTRADO) -- sem isso, pd.concat(axis=1)
+        # faz union dos dois índices por padrão, e como o lado sem filtro tem TODAS as
+        # categorias do stub (ex.: 13 UFs) contra só as que sobrevivem ao filtro (ex.: 2),
+        # a tabela final herdava linha extra pras categorias filtradas fora, preenchida
+        # com None -- exatamente o "CEARÁ aparece vazio" visto em produção. O filtro que
+        # o usuário aplicou é quem decide quais linhas existem; "sem filtro" só empresta
+        # os números delas, nunca acrescenta categoria nova.
+        unfiltered_table = unfiltered_table.reindex(table.index)
+        unfiltered_mask = unfiltered_mask.reindex(table.index)
         unfiltered_table.columns = pd.MultiIndex.from_tuples(
             [("Total geral (sem filtro)", c[1]) for c in unfiltered_table.columns]
         )
@@ -241,6 +254,8 @@ def _render_cruzamento_tab(
             st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
 
     st.subheader(f"{options[stub_key]}")
+    if use_weighting:
+        st.caption("⚖️ %LINHA e %COLUNA aplicando peso amostral (PESO) — NA continua contagem bruta.")
 
     with st.expander("❓ Como ler esses números"):
         st.markdown(
@@ -261,6 +276,10 @@ def _render_cruzamento_tab(
             "stub, ou cobertura baixa da pergunta (nem todo mundo respondeu) — não é erro de conta.\n"
             "- Se %LINHA de uma categoria não soma perto de 100%, é sinal de que nem todo mundo "
             "daquele grupo respondeu a pergunta.\n"
+            "- **%COLUNA pode somar mais de 100%** quando a variável de linha (stub) é de "
+            "múltipla resposta: quem marcou 2+ opções é contado em 2+ categorias ao mesmo "
+            "tempo, então a soma passa a refletir *menções*, não pessoas. Não é erro de conta "
+            "— é o esperado sempre que o stub permite mais de uma resposta por pessoa.\n"
             "- **Gráfico de %LINHA** compara grupos entre si; **gráfico de %COLUNA** mostra o "
             "perfil de quem escolheu cada opção — geralmente %LINHA é a leitura mais direta."
         )
@@ -355,10 +374,39 @@ def _render_cruzamento_tab(
             st.caption("Quem compõe cada resposta — o perfil de quem escolheu cada opção.")
 
     col_csv, col_xlsx = st.columns(2)
+    export_ready_key = "export_ready_cruzamento"
+    export_signature_key = "export_signature_cruzamento"
+    # assinatura simples do estado atual (filtro + stub + banner) -- se mudar
+    # desde a última preparação, a exportação anterior fica obsoleta e
+    # exigimos recomputar antes de liberar o download de novo.
+    current_signature = (stub_key, tuple(banner_keys), tuple(sorted(active_filters.items())), na_handling)
+    if st.session_state.get(export_signature_key) != current_signature:
+        st.session_state[export_ready_key] = False
+
+    if not st.session_state.get(export_ready_key):
+        st.button(
+            "Preparar exportação (CSV/Excel)",
+            key="prepare_export_cruzamento",
+            help=(
+                "Fixa a tabela atual antes de gerar os arquivos -- clicar direto em "
+                "'Baixar' sem esse passo pode, em alguns casos, capturar um estado de "
+                "filtro anterior ao seu ajuste mais recente (comportamento documentado "
+                "do Streamlit em botões de download com dado calculado dinamicamente)."
+            ),
+        )
+        if st.session_state.get("prepare_export_cruzamento"):
+            st.session_state[export_ready_key] = True
+            st.session_state[export_signature_key] = current_signature
+            st.rerun()
+        return
+
+    csv_bytes = format_table_for_export(table).to_csv().encode("utf-8")
+    xlsx_bytes = banner_table_to_excel_bytes(table, mask)
+
     with col_csv:
         st.download_button(
             "Baixar banner (CSV)",
-            data=format_table_for_export(table).to_csv().encode("utf-8"),
+            data=csv_bytes,
             file_name="banner.csv",
             mime="text/csv",
             key="download_banner_csv",
@@ -366,7 +414,7 @@ def _render_cruzamento_tab(
     with col_xlsx:
         st.download_button(
             "Baixar banner (Excel)",
-            data=banner_table_to_excel_bytes(table, mask),
+            data=xlsx_bytes,
             file_name="banner.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_banner_xlsx",
@@ -803,7 +851,7 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
 #  BARRA LATERAL
 # ══════════════════════════════════════════════════════════════════════
 
-def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.DataFrame, str, list[str], str, int, dict]:
+def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.DataFrame, str, list[str], str, int, dict, bool]:
     """
     Monta a barra lateral inteira (filtro de base, seleção de stub/
     banner, regras) e já aplica o filtro escolhido, devolvendo tudo que
@@ -845,18 +893,28 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
 
             prev_key = f"filter_{fk}"
             prev_choice = st.session_state.get(prev_key)
-            # Streamlit descarta sozinho qualquer valor de `default`/estado anterior que não
-            # esteja mais em `options` -- mas faz isso em silêncio. Avisamos aqui pra não virar
-            # "por que minha seleção sumiu sozinha".
-            if prev_choice is not None:
+            # Bug real encontrado em produção: Streamlit documenta que "if you use a key
+            # and change a widget's default value, there will be no change to the widget's
+            # state" -- ou seja, com key= já presente no session_state, mudar `default=`
+            # (que é o que a cascata faz a cada rerun, conforme `available` encolhe) NÃO
+            # reseta o valor interno do widget. A tela pode mostrar só os chips que ainda
+            # cabem em `available`, mas o valor devolvido por st.multiselect() pode
+            # carregar categoria de uma seleção anterior que já não é mais válida --
+            # exatamente o "filtro não corta" visto em produção. Corrigimos escrevendo o
+            # session_state manualmente ANTES de desenhar o widget, e nunca passando
+            # `default=` junto de `key=` (a causa raiz do comportamento documentado acima).
+            if prev_choice is None:
+                st.session_state[prev_key] = available
+            else:
                 dropped = [v for v in prev_choice if v not in available]
                 if dropped:
                     st.caption(
                         f"Em '{options[fk]}': {', '.join(str(v) for v in dropped)} não "
                         f"sobrevive(m) ao(s) filtro(s) anterior(es) e foi(ram) removido(s) da seleção."
                     )
+                    st.session_state[prev_key] = [v for v in prev_choice if v in available]
 
-            chosen = st.multiselect(f"Manter em '{options[fk]}'", options=available, default=available, key=prev_key)
+            chosen = st.multiselect(f"Manter em '{options[fk]}'", options=available, key=prev_key)
             active_filters[fk] = chosen
 
             if not available:
@@ -877,14 +935,32 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
         )
 
         st.header("3. Regras")
+        use_weighting = st.toggle(
+            "Aplicar peso amostral (PESO)",
+            value=False,
+            help=(
+                "Desligado por padrão: %LINHA/%COLUNA usam contagem bruta (NA), sem "
+                "peso amostral -- é o padrão de referência usado hoje. O peso amostral "
+                "é calibrado pra representar o universo TOTAL do estudo; dentro de um "
+                "recorte já filtrado (ex.: uma diretoria específica), reaplicar esse "
+                "mesmo peso pode inflar/distorcer a proporção entre categorias, porque "
+                "ele não foi recalibrado pra esse subgrupo menor. Ligue só se você "
+                "sabe que precisa do peso mesmo dentro do recorte atual -- ex.: "
+                "comparando o recorte contra o total nacional lado a lado."
+            ),
+        )
         na_handling = st.radio(
             "Categoria 'N/A - ...' em indicadores",
             options=["keep", "exclude"],
             format_func=lambda v: "Manter como categoria" if v == "keep" else "Excluir da base",
             help=(
-                "Indicadores de baixa incidência (ex.: avaliação de atendimento, "
-                "quando a maioria nunca contatou) ficam com N/A dominante se mantido, "
-                "e com base muito pequena se excluído. Escolha por variável ainda não "
+                "Muda o DENOMINADOR de todos os percentuais dos indicadores, não só o "
+                "rótulo -- 'Excluir da base' recalcula %LINHA/%COLUNA só sobre quem "
+                "respondeu de fato, então o mesmo indicador pode mostrar números "
+                "diferentes dependendo dessa escolha. Indicadores de baixa incidência "
+                "(ex.: avaliação de atendimento, quando a maioria nunca contatou) ficam "
+                "com N/A dominante se mantido, e com base muito pequena (BASE menor, "
+                "célula pode ficar amarela) se excluído. Escolha por variável ainda não "
                 "está implementado nesta versão — é o próximo incremento."
             ),
         )
@@ -903,7 +979,7 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
             st.warning("O filtro de base zerou a amostra. Ajuste as seleções na barra lateral.")
             st.stop()
 
-    return filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters
+    return filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -932,14 +1008,14 @@ def main() -> None:
         f"({n_mr} são blocos de múltipla resposta, unpivotados automaticamente)."
     )
 
-    filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters = _render_sidebar(data, meta, options)
+    filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting = _render_sidebar(data, meta, options)
 
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
 
     tab_cruzamento, tab_indices, tab_dados = st.tabs(["📊 Cruzamento", "📈 Índices", "🩺 Diagnóstico de dados"])
     with tab_cruzamento:
-        _render_cruzamento_tab(data, meta, options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters)
+        _render_cruzamento_tab(data, meta, options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting)
     with tab_indices:
         _render_indices_tab(data, meta, options, filtered_data)
     with tab_dados:

@@ -69,8 +69,22 @@ _NA_TEXT_PATTERN = r"^N/A\b"
 #  PESO E ACESSO SEGURO A COLUNA
 # ══════════════════════════════════════════════════════════════════════
 
-def get_weights(data: pd.DataFrame, meta: dict[str, VariableMeta]) -> pd.Series:
-    """Devolve a série de pesos alinhada ao índice do df. Peso 1.0 pra toda linha se não houver coluna PESO."""
+def get_weights(data: pd.DataFrame, meta: dict[str, VariableMeta], use_weighting: bool = True) -> pd.Series:
+    """
+    Devolve a série de pesos alinhada ao índice do df. Peso 1.0 pra toda
+    linha se não houver coluna PESO, ou se `use_weighting=False`.
+
+    `use_weighting=False` existe pra reproduzir leitura NÃO ponderada
+    (contagem bruta) -- decisão de metodologia confirmada por Ro em
+    15/09: "no geral costuma usar os dados não ponderado". Devolver
+    peso uniforme em vez de bifurcar a lógica de cálculo em cada função
+    consumidora (`to_long`, `_build_single_block`, `compute_index_trend`
+    etc.) mantém o pipeline ponderado e não-ponderado idêntico em tudo
+    MENOS o valor do peso -- reduz risco de os dois caminhos divergirem
+    silenciosamente no futuro.
+    """
+    if not use_weighting:
+        return pd.Series(1.0, index=data.index)
     weight_names = [m.name for m in meta.values() if m.var_type == VarType.WEIGHT]
     if not weight_names:
         return pd.Series(1.0, index=data.index)
@@ -128,6 +142,47 @@ def _mr_selected_mask(col: pd.Series) -> pd.Series:
     return col.notna()
 
 
+_ISDE_LABEL_FIX_VALUE = "Média próxima ou igual a 5 (>=4,5)"
+"""
+Bug de exportação conhecido na categórica `ISDE`: a faixa mais alta
+(nota 5) chega do Excel/Quantum como o literal booleano "False" em vez
+do rótulo esperado -- provavelmente uma fórmula tipo "nota>=4.5" que
+nunca foi trocada pelo texto nas outras 4 faixas.
+
+Confirmado célula a célula contra `P23_media` (o companion numérico
+real do ISDE, ver `_MEDIA_ALIASES` em indices.py): das 8.890 linhas
+com ISDE=="False", 8.768 (98,6%) têm P23_media==5.0 -- essas são
+corrigidas aqui. As 122 restantes (1,4%) têm P23_media != 5.0 e são
+100% concentradas na onda 2023 -- padrão diferente, possivelmente uma
+causa distinta específica daquele lote. NÃO são corrigidas aqui por
+falta de evidência de que é o mesmo bug; ficam como "False" na tela de
+propósito, pra continuar visivelmente estranho até alguém investigar
+a origem própria dessas 122 linhas.
+
+Não afeta o ÍNDICE numérico (já usa P23_media, nunca lê ISDE direto) --
+só a variável categórica ISDE quando usada como stub/banner na aba
+Cruzamento, que é onde o texto errado aparecia na tela.
+"""
+
+
+def _fix_known_label_bugs(key: str, col: pd.Series, media_col: pd.Series | None = None) -> pd.Series:
+    """
+    Aplica correção de rótulo conhecida (hoje só ISDE) se `key` for uma
+    das afetadas -- passa direto pras demais. `media_col`, quando
+    fornecida, restringe a correção só às linhas onde o companion
+    numérico confirma o valor esperado (ver docstring de
+    `_ISDE_LABEL_FIX_VALUE`); sem ela, a correção não é aplicada -- é
+    preferível manter "False" visível a arriscar rótulo errado sem a
+    validação cruzada.
+    """
+    if key != "ISDE" or media_col is None:
+        return col
+    fixed = col.astype(str)
+    confirmed = (fixed == "False") & (media_col == 5.0)
+    fixed = fixed.where(~confirmed, _ISDE_LABEL_FIX_VALUE)
+    return fixed
+
+
 def to_long(
     data: pd.DataFrame,
     meta: dict[str, VariableMeta],
@@ -171,6 +226,8 @@ def to_long(
 
     m = meta[key]
     col = _get_series(data, m.name)
+    if key == "ISDE" and "P23_media" in data.columns:
+        col = _fix_known_label_bugs(key, col, media_col=_get_series(data, "P23_media"))
     mask = col.notna()
     if m.var_type == VarType.INDICATOR and na_handling == "exclude":
         mask &= ~col.astype(str).str.match(_NA_TEXT_PATTERN, case=False, na=False)
@@ -399,6 +456,7 @@ def build_banner(
     banner_keys: list[str],
     na_handling: str = "keep",
     small_n_threshold: int = 30,
+    use_weighting: bool = False,
 ) -> list[BannerBlock]:
     """
     Ponto de entrada principal do motor -- é a única função deste módulo
@@ -416,8 +474,18 @@ def build_banner(
     denominador do %LINHA. `banner_keys=[]` devolve só esse bloco Total
     (usado por `app.py` pra montar a coluna "Total geral (sem filtro)"
     quando um filtro de base está ativo).
+
+    `use_weighting`: default False -- a leitura padrão é NÃO ponderada
+    (contagem bruta), confirmado como padrão de referência (Ro, 15/09):
+    aplicar o peso amostral nacional dentro de um recorte já filtrado
+    infla/distorce a proporção, porque o peso foi calibrado pro
+    universo total, não pro subgrupo filtrado -- foi assim que a
+    divergência entre a tabela de referência (não ponderada, ex.:
+    AMAZONAS/PROPRIA=72,9%) e o app (ponderado, 95,0%) apareceu, com o
+    mesmo NA em ambos. `True` fica disponível como opção explícita do
+    analista, não como padrão.
     """
-    weights = get_weights(data, meta)
+    weights = get_weights(data, meta, use_weighting=use_weighting)
 
     total_meta_key = "__TOTAL__"
     blocks = []

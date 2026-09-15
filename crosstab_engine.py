@@ -9,7 +9,7 @@ cruza duas variáveis (stub x banner), pondera por peso amostral, monta a
 tabela no formato NA/%LINHA/%COLUNA, e decide quando avisar que um número
 merece leitura cautelosa (base pequena, cobertura baixa/concentrada).
 `app.py` só chama `build_banner` e desenha o resultado -- toda a
-estatística mora aqui.
+estatística mora aqui
 
 DECISÃO CENTRAL DE ARQUITETURA -- O FORMATO "LONGO"
 ------------------------------------------------------

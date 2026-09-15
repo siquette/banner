@@ -9,7 +9,7 @@ está em `metadata.py`, `crosstab_engine.py` e `indices.py`, cada um
 testado isoladamente. Este arquivo só orquestra widgets do Streamlit e
 desenha o resultado -- se uma mudança aqui está alterando um NÚMERO, não
 só a apresentação dele, provavelmente ela deveria estar num dos outros
-três módulos.
+três módulo.
 
 BANCO FIXO
 -----------

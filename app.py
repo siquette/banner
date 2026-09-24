@@ -680,31 +680,39 @@ def _render_comparacao_tab(
     use_weighting: bool,
 ) -> None:
     """
-    De 2 a 4 cruzamentos independentes lado a lado, pra comparação visual
-    direta -- a hipótese de UX sendo testada neste PoC (ver decisão com
-    Ro: o problema real não é "caber mais informação no dashboard", é
-    "comparar cortes sem depender de memória de curto prazo trocando de
-    aba").
+    De 2 a 4 cruzamentos independentes num grid 2x2, pra comparação
+    visual direta -- a hipótese de UX sendo testada neste PoC (ver
+    decisão com Ro: o problema real não é "caber mais informação no
+    dashboard", é "comparar cortes sem depender de memória de curto
+    prazo trocando de aba").
 
     DECISÕES DE ESCOPO, já fechadas com Ro antes deste código existir:
-    - Quantidade de painéis é escolhida pelo analista (2/3/4), não fixa --
-      `st.columns(n_panels)` divide a largura só entre os painéis
-      realmente em uso, sem coluna vazia sobrando quando n_panels < 4.
+    - Quantidade de painéis é escolhida pelo analista (2/3/4).
+    - GRID 2x2, não uma fileira única de `st.columns(n_panels)`: com 4
+      painéis numa linha só, cada um herda 1/4 da largura -- pouco pra
+      uma tabela banner (várias colunas de categoria por natureza), os
+      rótulos truncam. Em 2 linhas de `st.columns(2)`, cada painel
+      herda 1/2 da largura -- a mesma largura já validada como
+      confortável com N=2 (ver `_grid_layout`).
+    - N=2 -> uma linha só, `st.columns(2)`, sem grid (idêntico ao
+      comportamento original antes de existir escolha de quantidade).
+    - N=3 -> A e B na primeira linha; C sozinho na segunda linha, com a
+      4ª vaga VAZIA ao lado dele (decisão de Ro: preferiu manter os 3
+      painéis do mesmo tamanho a esticar C pra ocupar a linha toda).
+    - N=4 -> 2 linhas de `st.columns(2)`, todas as 4 vagas preenchidas.
     - SEM slider de largura por painel (decisão explícita de Ro) -- os N
-      painéis sempre dividem a largura em partes iguais. "Redimensionar
-      arrastando" não existe em Streamlit puro (`st.columns` só aceita
-      pesos definidos em código, não arraste de mouse); like a atual
-      confusão seria maior que o ganho, por isso nem um slider de peso
-      substituto foi construído.
+      painéis sempre dividem a largura em partes iguais dentro de cada
+      linha. "Redimensionar arrastando" não existe em Streamlit puro
+      (`st.columns` só aceita pesos definidos em código, não arraste de
+      mouse); um slider de peso substituto foi avaliado e descartado --
+      a confusão adicionada seria maior que o ganho.
     - Painel oculto (ex.: C/D quando n_panels=2) MANTÉM sua configuração
-      em `st.session_state` -- não temos código de "salvar ao esconder"
-      porque não precisa: `key=f"{prefix}_stub"` etc. já persiste entre
-      reruns independente de o painel ser desenhado ou não naquele rerun.
-      Voltar pra n_panels=4 faz C/D reaparecerem como estavam. Isso é
-      decisão de Ro (manter > resetar), e funciona de graça pela forma
-      como `_render_comparison_panel` já usa `key=` desde o início --
-      não seria tão simples se os valores fossem guardados em variável
-      local em vez de `session_state`.
+      -- persistido manualmente via `_PERSIST_KEY`/`_save_persisted`,
+      NÃO só por `key=` do widget. Verificado com AppTest que
+      `session_state[key]` de um widget some quando ele não é desenhado
+      num rerun -- por isso o dict próprio existe, ver docstring de
+      `_persisted_widget_default`. Voltar pra n_panels=4 faz C/D
+      reaparecerem como estavam.
     - Filtro de base e peso amostral são COMPARTILHADOS entre todos os
       painéis (vêm de `filtered_data`/`use_weighting`, calculados uma vez
       só em `_render_sidebar`) -- só stub, banner e escolha de gráfico
@@ -729,10 +737,11 @@ def _render_comparacao_tab(
         horizontal=True,
         key="cmp_n_panels",
         help=(
-            "A tabela banner tem várias colunas de categoria por natureza -- acima de "
-            "4 painéis lado a lado ela deixa de caber de forma legível, por isso o teto "
-            "é 4. Reduzir a quantidade não apaga a configuração dos painéis escondidos "
-            "-- eles reaparecem como estavam se você aumentar de novo."
+            "A tabela banner tem várias colunas de categoria por natureza -- por isso o "
+            "grid é sempre 2 colunas (nunca 4 numa fileira só), pra cada painel manter "
+            "largura suficiente pra tabela não truncar. Reduzir a quantidade não apaga a "
+            "configuração dos painéis escondidos -- eles reaparecem como estavam se você "
+            "aumentar de novo."
         ),
     )
 
@@ -745,13 +754,22 @@ def _render_comparacao_tab(
             bargroupgap = st.slider("Espaço dentro do grupo", 0.0, 0.9, 0.1, 0.05, key="cmp_bargroupgap")
 
     panel_labels = ["A", "B", "C", "D"][:n_panels]
-    columns = st.columns(n_panels)
-    for label, col in zip(panel_labels, columns):
-        with col:
-            _render_comparison_panel(
-                label, label.lower(), data, filtered_data, meta, options, na_handling,
-                small_n_threshold, active_filters, use_weighting, bargap, bargroupgap,
-            )
+    # Grid 2 colunas, quantas linhas N exigir -- N=3 é o único caso com
+    # vaga sobrando (3 não é múltiplo de 2); decisão de Ro: fica vazia,
+    # não esticamos o painel ímpar pra ocupar a linha toda.
+    for row_start in range(0, n_panels, 2):
+        row_labels = panel_labels[row_start:row_start + 2]
+        row_columns = st.columns(2)
+        for label, col in zip(row_labels, row_columns):
+            with col:
+                _render_comparison_panel(
+                    label, label.lower(), data, filtered_data, meta, options, na_handling,
+                    small_n_threshold, active_filters, use_weighting, bargap, bargroupgap,
+                )
+        # vaga vazia de N=3: row_columns[1] existe mas não recebe painel
+        # nenhum -- a coluna do Streamlit já foi criada e ocupa espaço
+        # reservado, então o vazio aparece como espaço em branco mesmo,
+        # não como coluna colapsada.
 
 
 # ══════════════════════════════════════════════════════════════════════

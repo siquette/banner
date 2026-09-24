@@ -84,6 +84,44 @@ def _load_and_classify(path: str) -> tuple[pd.DataFrame, dict]:
     return data, meta
 
 
+@st.cache_data(show_spinner=False)
+def _build_banner_cached(
+    data: pd.DataFrame,
+    meta: dict,
+    stub_key: str,
+    banner_keys: tuple[str, ...],
+    na_handling: str,
+    small_n_threshold: int,
+    use_weighting: bool,
+) -> list:
+    """
+    Wrapper cacheado sobre `crosstab_engine.build_banner` -- vive aqui em
+    `app.py`, não dentro do motor, porque cache é decisão de orquestração
+    de UI (depende de como o Streamlit reroda o script), não faz parte
+    da lógica de cruzamento em si.
+
+    POR QUE ISSO PRECISAVA EXISTIR: sem cache, `build_banner` recalculava
+    do zero a CADA rerun do Streamlit -- inclusive quando a interação nem
+    tinha relação com o cruzamento (ex.: mexer no slider de espaçamento
+    de barra do gráfico). Isso já era desperdício com 1 cruzamento na
+    tela; com o modo Comparação (2 cruzamentos simultâneos, ver
+    `_render_comparacao_tab`), o mesmo desperdício dobra -- por isso essa
+    função é pré-requisito do modo Comparação, não um extra dele.
+
+    `banner_keys` é `tuple`, não `list`, porque `@st.cache_data` precisa
+    hashear os argumentos pra decidir se reusa o resultado -- `list` não
+    é hasheável, `tuple` é. Todo call site abaixo converte antes de
+    chamar.
+
+    `data` (o DataFrame inteiro) segue sendo hasheado pelo Streamlit a
+    cada chamada -- tem custo, mas é o mesmo custo que `_load_and_classify`
+    já paga hoje; não otimizamos isso agora (ex.: cache manual por
+    `id(data)`) sem medir primeiro se o hash do df é o gargalo real ou
+    se o ganho já vem todo do cache do cruzamento em si.
+    """
+    return build_banner(data, meta, stub_key, list(banner_keys), na_handling, small_n_threshold, use_weighting)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  GRÁFICOS
 # ══════════════════════════════════════════════════════════════════════
@@ -207,7 +245,7 @@ def _render_cruzamento_tab(
         st.warning("Selecione ao menos uma variável de banner na barra lateral.")
         return
 
-    blocks = build_banner(filtered_data, meta, stub_key, banner_keys, na_handling, small_n_threshold, use_weighting)
+    blocks = _build_banner_cached(filtered_data, meta, stub_key, tuple(banner_keys), na_handling, small_n_threshold, use_weighting)
     if not blocks:
         st.warning(
             "Nenhuma das variáveis de banner selecionadas tem respondente elegível "
@@ -225,7 +263,7 @@ def _render_cruzamento_tab(
         # `use_weighting` do lado filtrado -- as duas colunas precisam da
         # mesma convenção, senão a comparação lado a lado mistura ponderado
         # com não-ponderado silenciosamente.
-        unfiltered_blocks = build_banner(data, meta, stub_key, [], na_handling, small_n_threshold, use_weighting)
+        unfiltered_blocks = _build_banner_cached(data, meta, stub_key, (), na_handling, small_n_threshold, use_weighting)
         unfiltered_table = format_banner_table_full(unfiltered_blocks)
         unfiltered_mask = small_n_mask_full(unfiltered_blocks)
         # reindex pro índice de `table` (o lado FILTRADO) -- sem isso, pd.concat(axis=1)
@@ -373,9 +411,38 @@ def _render_cruzamento_tab(
             st.plotly_chart(fig2, width='stretch')
             st.caption("Quem compõe cada resposta — o perfil de quem escolheu cada opção.")
 
+    _render_export_controls(table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix="cruzamento")
+
+
+def _render_export_controls(
+    table: pd.DataFrame,
+    mask: pd.DataFrame,
+    stub_key: str,
+    banner_keys: list[str],
+    active_filters: dict,
+    na_handling: str,
+    key_prefix: str,
+) -> None:
+    """
+    Fluxo de exportação (CSV/Excel) com o passo de "preparar antes de
+    baixar" -- extraído de `_render_cruzamento_tab` pra ser chamado por
+    mais de um lugar (modo Sozinho E cada painel do modo Comparação,
+    ver `_render_comparacao_tab`) sem duplicar a lógica em si.
+
+    `key_prefix` é OBRIGATÓRIO e é o motivo desta função existir como
+    função, não como copiar-colar do bloco original: todo `key=` de
+    widget aqui dentro é derivado dele (`f"{key_prefix}_export_ready"`
+    etc.). Sem esse prefixo, dois painéis do modo Comparação (A e B)
+    compartilhariam a MESMA chave de session_state -- apertar "preparar"
+    no painel A marcaria o B como pronto também, e um download pisaria
+    no outro. É o mesmo tipo de bug de `key=` colidindo que já foi
+    corrigido no filtro em cascata da sidebar (ver comentário em
+    `_render_sidebar`); a correção aqui é preventiva, não uma reação a
+    um bug visto em produção.
+    """
     col_csv, col_xlsx = st.columns(2)
-    export_ready_key = "export_ready_cruzamento"
-    export_signature_key = "export_signature_cruzamento"
+    export_ready_key = f"{key_prefix}_export_ready"
+    export_signature_key = f"{key_prefix}_export_signature"
     # assinatura simples do estado atual (filtro + stub + banner) -- se mudar
     # desde a última preparação, a exportação anterior fica obsoleta e
     # exigimos recomputar antes de liberar o download de novo.
@@ -386,7 +453,7 @@ def _render_cruzamento_tab(
     if not st.session_state.get(export_ready_key):
         st.button(
             "Preparar exportação (CSV/Excel)",
-            key="prepare_export_cruzamento",
+            key=f"{key_prefix}_prepare_export",
             help=(
                 "Fixa a tabela atual antes de gerar os arquivos -- clicar direto em "
                 "'Baixar' sem esse passo pode, em alguns casos, capturar um estado de "
@@ -394,7 +461,7 @@ def _render_cruzamento_tab(
                 "do Streamlit em botões de download com dado calculado dinamicamente)."
             ),
         )
-        if st.session_state.get("prepare_export_cruzamento"):
+        if st.session_state.get(f"{key_prefix}_prepare_export"):
             st.session_state[export_ready_key] = True
             st.session_state[export_signature_key] = current_signature
             st.rerun()
@@ -409,7 +476,7 @@ def _render_cruzamento_tab(
             data=csv_bytes,
             file_name="banner.csv",
             mime="text/csv",
-            key="download_banner_csv",
+            key=f"{key_prefix}_download_csv",
         )
     with col_xlsx:
         st.download_button(
@@ -417,8 +484,274 @@ def _render_cruzamento_tab(
             data=xlsx_bytes,
             file_name="banner.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_banner_xlsx",
+            key=f"{key_prefix}_download_xlsx",
         )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ABA: COMPARAR (dois cruzamentos lado a lado)
+# ══════════════════════════════════════════════════════════════════════
+
+_PERSIST_KEY = "_cmp_panel_state"
+"""
+Dict `{persist_key: valor}` fora do namespace de qualquer widget --
+sobrevive independente de qual painel está sendo desenhado neste rerun.
+Ver `_persisted_widget_default`.
+"""
+
+
+def _persisted_widget_default(persist_key: str, options: list, fallback_index: int = 0):
+    """
+    Índice inicial de um selectbox/multiselect que precisa sobreviver a
+    ficar "escondido" (o painel não é desenhado naquele rerun). Existe
+    porque `st.session_state[key]` de um widget SOME quando o widget não
+    é renderizado num rerun -- não fica parado esperando, como uma
+    variável Python comum ficaria (comportamento verificado empiricamente
+    com `streamlit.testing.v1.AppTest`, ver ways-of-working: testar
+    contra execução real, não assumir). Guardar o valor num dict PRÓPRIO
+    em `session_state` (`_PERSIST_KEY`, fora do namespace de qualquer
+    widget) é o que faz o valor sobreviver ao painel sumir e reaparecer.
+    """
+    saved = st.session_state.get(_PERSIST_KEY, {}).get(persist_key)
+    if saved in options:
+        return options.index(saved)
+    return fallback_index
+
+
+def _save_persisted(persist_key: str, value) -> None:
+    """Grava o valor atual de um widget no dict de persistência entre reruns."""
+    st.session_state.setdefault(_PERSIST_KEY, {})[persist_key] = value
+
+
+def _render_comparison_panel(
+    panel_label: str,
+    key_prefix: str,
+    data: pd.DataFrame,
+    filtered_data: pd.DataFrame,
+    meta: dict,
+    options: dict,
+    na_handling: str,
+    small_n_threshold: int,
+    active_filters: dict,
+    use_weighting: bool,
+    bargap: float,
+    bargroupgap: float,
+) -> None:
+    """
+    Um painel (A, B, C ou D) do modo Comparação -- stub/banner/tipo de
+    gráfico são escolhidos aqui, independentes dos demais painéis; filtro
+    de base e peso amostral vêm de fora (parâmetros `filtered_data`/
+    `use_weighting`), porque foram decididos como COMPARTILHADOS entre
+    todos os painéis, não configuráveis por painel (decisão de Ro: evita
+    a sidebar duplicar filtro em cascata múltiplas vezes, e mantém as
+    colunas comparáveis sobre a mesma base).
+
+    Só UM gráfico é desenhado (o escolhido no selectbox), não os dois
+    (%LINHA e %COLUNA) como no modo Sozinho -- é o corte que faz cada
+    painel caber em 1/N da largura de tela sem virar rolagem infinita.
+    A tabela numérica, em contraste, continua completa (NA/%LINHA/
+    %COLUNA) por decisão explícita de Ro -- é a fonte auditável, o
+    gráfico é só leitura rápida.
+
+    `key_prefix` (ex.: "a", "b", "c", "d") evita todo widget e toda
+    entrada de `session_state` deste painel colidir com a de outro --
+    mesmo princípio de `_render_export_controls`.
+
+    PERSISTÊNCIA AO ESCONDER O PAINEL (Ro: reduzir de 4 pra 2 painéis e
+    voltar pra 4 deve trazer C/D como estavam, não resetados): usa
+    `_persisted_widget_default`/`_save_persisted` em vez de confiar só em
+    `key=` -- ver docstring de `_persisted_widget_default` pro motivo.
+    """
+    st.markdown(f"#### Painel {panel_label}")
+
+    stub_options = list(options.keys())
+    stub_key = st.selectbox(
+        "Variável de linha (stub)",
+        options=stub_options,
+        format_func=lambda k: options[k],
+        index=_persisted_widget_default(f"{key_prefix}_stub", stub_options),
+        key=f"{key_prefix}_stub",
+    )
+    _save_persisted(f"{key_prefix}_stub", stub_key)
+
+    banner_options = [k for k in options if k != stub_key]
+    saved_banner = st.session_state.get(_PERSIST_KEY, {}).get(f"{key_prefix}_banner", [])
+    default_banner = [k for k in saved_banner if k in banner_options]
+    banner_keys = st.multiselect(
+        "Variáveis de banner (colunas)",
+        options=banner_options,
+        format_func=lambda k: options[k],
+        default=default_banner,
+        key=f"{key_prefix}_banner",
+    )
+    _save_persisted(f"{key_prefix}_banner", banner_keys)
+
+    chart_options = ["%LINHA", "%COLUNA"]
+    chart_side = st.selectbox(
+        "📊 Gráfico",
+        options=chart_options,
+        index=_persisted_widget_default(f"{key_prefix}_chart_side", chart_options),
+        key=f"{key_prefix}_chart_side",
+        help=(
+            "%LINHA compara os grupos do stub entre si (leitura mais direta pra "
+            "comparação); %COLUNA mostra o perfil de quem escolheu cada opção. "
+            "A tabela abaixo sempre mostra as duas, independente dessa escolha -- "
+            "isso só decide qual vira gráfico."
+        ),
+    )
+    _save_persisted(f"{key_prefix}_chart_side", chart_side)
+
+    if not banner_keys:
+        st.info("Selecione ao menos uma variável de banner pra este painel.")
+        return
+
+    blocks = _build_banner_cached(filtered_data, meta, stub_key, tuple(banner_keys), na_handling, small_n_threshold, use_weighting)
+    if not blocks:
+        st.warning("Nenhum respondente elegível cruzado nesse conjunto de dados.")
+        return
+
+    table = format_banner_table_full(blocks)
+    mask = small_n_mask_full(blocks)
+
+    total_n_ref = blocks[0].base_n["Total"]
+    for b in blocks[1:]:
+        own_n = b.base_n.sum()
+        pct = own_n / total_n_ref * 100 if total_n_ref else 0
+        st.caption(f"**{b.banner_label}**: resposta de {own_n:,} de {total_n_ref:,} ({pct:.1f}%)")
+        if b.coverage_warning:
+            st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
+
+    def _highlight_small_n(_: pd.DataFrame) -> pd.DataFrame:
+        styles = pd.DataFrame("", index=table.index, columns=table.columns)
+        for col in mask.columns:
+            styles.loc[mask.index, col] = mask[col].map(
+                lambda flagged: "background-color: #fff3cd; color: #000000" if flagged else ""
+            )
+        return styles
+
+    na_rows = table.index[table.index.get_level_values(1) == "NA"]
+    pct_rows = table.index[table.index.get_level_values(1) != "NA"]
+    styled = (
+        table.style
+        .apply(_highlight_small_n, axis=None)
+        .format("{:,.0f}", subset=pd.IndexSlice[na_rows, :])
+        .format("{:.1f}", subset=pd.IndexSlice[pct_rows, :])
+    )
+    # container com scroll próprio -- a alternativa (deixar a tabela livre)
+    # empurra a largura da coluna do painel além do que `st.columns(2)`
+    # reserva, e o layout dos dois painéis lado a lado quebra. Rolar uma
+    # tabela dentro de uma caixa de altura fixa é preferível a isso.
+    st.dataframe(styled, width='stretch', height=320)
+
+    row_totals_weighted = blocks[0].cell_weighted["Total"]
+    for b in blocks[1:]:
+        if chart_side == "%LINHA":
+            pct_df = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
+            pct_df = pct_df.fillna(0.0)
+            value_axis_title = f"% dentro de cada grupo de {options[stub_key]}"
+            value_context = "desse grupo"
+        else:
+            pct_df = b.pct
+            value_axis_title = "% de quem escolheu cada opção"
+            value_context = "de quem respondeu isso"
+
+        fig = _build_chart(
+            pct_df, "Barras",
+            title=f"{options[stub_key]} por {b.banner_label} — {chart_side}",
+            value_axis_title=value_axis_title,
+            legend_title=b.banner_label,
+            category_label=options[stub_key],
+            value_context=value_context,
+            bargap=bargap, bargroupgap=bargroupgap,
+        )
+        st.plotly_chart(fig, width='stretch', key=f"{key_prefix}_chart_{b.banner_key}")
+
+    _render_export_controls(table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix=key_prefix)
+
+
+def _render_comparacao_tab(
+    data: pd.DataFrame,
+    meta: dict,
+    options: dict,
+    filtered_data: pd.DataFrame,
+    na_handling: str,
+    small_n_threshold: int,
+    active_filters: dict,
+    use_weighting: bool,
+) -> None:
+    """
+    De 2 a 4 cruzamentos independentes lado a lado, pra comparação visual
+    direta -- a hipótese de UX sendo testada neste PoC (ver decisão com
+    Ro: o problema real não é "caber mais informação no dashboard", é
+    "comparar cortes sem depender de memória de curto prazo trocando de
+    aba").
+
+    DECISÕES DE ESCOPO, já fechadas com Ro antes deste código existir:
+    - Quantidade de painéis é escolhida pelo analista (2/3/4), não fixa --
+      `st.columns(n_panels)` divide a largura só entre os painéis
+      realmente em uso, sem coluna vazia sobrando quando n_panels < 4.
+    - SEM slider de largura por painel (decisão explícita de Ro) -- os N
+      painéis sempre dividem a largura em partes iguais. "Redimensionar
+      arrastando" não existe em Streamlit puro (`st.columns` só aceita
+      pesos definidos em código, não arraste de mouse); like a atual
+      confusão seria maior que o ganho, por isso nem um slider de peso
+      substituto foi construído.
+    - Painel oculto (ex.: C/D quando n_panels=2) MANTÉM sua configuração
+      em `st.session_state` -- não temos código de "salvar ao esconder"
+      porque não precisa: `key=f"{prefix}_stub"` etc. já persiste entre
+      reruns independente de o painel ser desenhado ou não naquele rerun.
+      Voltar pra n_panels=4 faz C/D reaparecerem como estavam. Isso é
+      decisão de Ro (manter > resetar), e funciona de graça pela forma
+      como `_render_comparison_panel` já usa `key=` desde o início --
+      não seria tão simples se os valores fossem guardados em variável
+      local em vez de `session_state`.
+    - Filtro de base e peso amostral são COMPARTILHADOS entre todos os
+      painéis (vêm de `filtered_data`/`use_weighting`, calculados uma vez
+      só em `_render_sidebar`) -- só stub, banner e escolha de gráfico
+      são independentes por painel.
+    - Espaçamento de barra (`bargap`/`bargroupgap`) é compartilhado entre
+      todos os painéis -- suposição minha, não pedido explícito de Ro;
+      reavaliar se ele quiser gap independente por painel.
+    - Tabela numérica sempre completa (NA/%LINHA/%COLUNA); só o GRÁFICO é
+      cortado pra uma leitura por vez.
+    - Exportação CSV/Excel mantida em cada painel (decisão de Ro: quem
+      está comparando pode querer levar um dos lados pro relatório sem
+      sair do modo comparação).
+    """
+    st.caption(
+        "Cruzamentos lado a lado, sobre a mesma base filtrada e o mesmo peso amostral "
+        "da barra lateral. Stub, banner e tipo de gráfico são escolhidos por painel."
+    )
+
+    n_panels = st.radio(
+        "Quantidade de painéis",
+        options=[2, 3, 4],
+        horizontal=True,
+        key="cmp_n_panels",
+        help=(
+            "A tabela banner tem várias colunas de categoria por natureza -- acima de "
+            "4 painéis lado a lado ela deixa de caber de forma legível, por isso o teto "
+            "é 4. Reduzir a quantidade não apaga a configuração dos painéis escondidos "
+            "-- eles reaparecem como estavam se você aumentar de novo."
+        ),
+    )
+
+    bargap, bargroupgap = 0.2, 0.1
+    with st.expander(f"Ajustar espaçamento de barra (aplicado aos {n_panels} painéis)"):
+        col_gap1, col_gap2 = st.columns(2)
+        with col_gap1:
+            bargap = st.slider("Espaço entre grupos", 0.0, 0.9, 0.2, 0.05, key="cmp_bargap")
+        with col_gap2:
+            bargroupgap = st.slider("Espaço dentro do grupo", 0.0, 0.9, 0.1, 0.05, key="cmp_bargroupgap")
+
+    panel_labels = ["A", "B", "C", "D"][:n_panels]
+    columns = st.columns(n_panels)
+    for label, col in zip(panel_labels, columns):
+        with col:
+            _render_comparison_panel(
+                label, label.lower(), data, filtered_data, meta, options, na_handling,
+                small_n_threshold, active_filters, use_weighting, bargap, bargroupgap,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1013,9 +1346,13 @@ def main() -> None:
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
 
-    tab_cruzamento, tab_indices, tab_dados = st.tabs(["📊 Cruzamento", "📈 Índices", "🩺 Diagnóstico de dados"])
+    tab_cruzamento, tab_comparacao, tab_indices, tab_dados = st.tabs(
+        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "🩺 Diagnóstico de dados"]
+    )
     with tab_cruzamento:
         _render_cruzamento_tab(data, meta, options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting)
+    with tab_comparacao:
+        _render_comparacao_tab(data, meta, options, filtered_data, na_handling, small_n_threshold, active_filters, use_weighting)
     with tab_indices:
         _render_indices_tab(data, meta, options, filtered_data)
     with tab_dados:

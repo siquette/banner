@@ -46,12 +46,15 @@ import streamlit as st
 from crosstab_engine import (
     banner_table_to_excel_bytes,
     build_banner,
+    describe_block_base,
     format_banner_table_full,
     format_table_for_export,
     get_column_series,
     get_weights,
+    linha_pct_frame,
     small_n_mask_full,
     table_to_excel_bytes,
+    variables_with_data,
 )
 from indices import compute_index_trend, compute_quadrant_data, indicator_media_map
 from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels, sort_categories
@@ -93,6 +96,7 @@ def _build_banner_cached(
     na_handling: str,
     small_n_threshold: int,
     use_weighting: bool,
+    use_universe: bool = True,
 ) -> list:
     """
     Wrapper cacheado sobre `crosstab_engine.build_banner` -- vive aqui em
@@ -119,7 +123,30 @@ def _build_banner_cached(
     `id(data)`) sem medir primeiro se o hash do df é o gargalo real ou
     se o ganho já vem todo do cache do cruzamento em si.
     """
-    return build_banner(data, meta, stub_key, list(banner_keys), na_handling, small_n_threshold, use_weighting)
+    return build_banner(
+        data, meta, stub_key, list(banner_keys), na_handling, small_n_threshold, use_weighting,
+        use_universe=use_universe,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _visible_keys_cached(filters_signature: tuple, _filtered_data: pd.DataFrame, _meta: dict, keys: tuple) -> tuple:
+    """
+    Quais variáveis cruzáveis têm ao menos uma resposta na base já filtrada
+    (ver `crosstab_engine.variables_with_data`). Cacheado por ASSINATURA DOS
+    FILTROS, não pelo DataFrame: o parâmetro `_filtered_data` começa com
+    `_` justamente pra o Streamlit NÃO hashear o df (hashear ~100 mil linhas
+    x 1.100 colunas a cada rerun custaria mais que o próprio cálculo). É
+    seguro porque a base filtrada é função determinística dos filtros
+    (cascata em ordem) sobre um parquet fixo.
+
+    Sempre usa na_handling='keep': a lista de variáveis é montada na barra
+    lateral ANTES do seletor de N/A existir naquele rerun, e uma variável
+    que só tem 'N/A - ...' continua sendo uma pergunta que existe nesse
+    recorte -- quem decide excluir N/A vê o bloco sumir do cruzamento (o
+    motor já descarta bloco vazio), não a variável sumir da lista.
+    """
+    return tuple(sorted(variables_with_data(_filtered_data, _meta, list(keys), "keep")))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -132,14 +159,20 @@ CHART_TYPES = ["Barras", "Barra horizontal", CHART_STACKED, "Linha"]
 # Abaixo disso o segmento é estreito demais pro rótulo caber dentro: o
 # Plotly corta ou sobrepõe o texto. O valor continua no hover.
 _STACKED_MIN_LABEL_PCT = 4.0
+# Segmento que completa a barra até 100% (quem está no grupo mas tem a variável
+# EM BRANCO na base). NÃO começa com "N/A" de propósito: categorias reais "N/A - ..."
+# do indicador já são cinza (#9E9E9E) e ficavam idênticas a este, lado a lado.
+_STACKED_GAP_LABEL = "Em branco na base"
+_STACKED_GAP_COLOR = "#E3E3E3"  # cinza bem claro: distinto do cinza das categorias "N/A - ..."
 
 
 def _stacked_sum_note(pct_df: pd.DataFrame, tolerance: float = 1.0) -> str | None:
     """
     Avisa quando as barras do empilhado NÃO somam 100%.
 
-    O gráfico se chama "100%", mas %LINHA aqui divide pela base do Total
-    do stub (não pela base de quem respondeu o banner), então a soma só
+    O gráfico se chama "100%", mas %LINHA divide pela base do bloco (universo
+    da pergunta, ou Total do stub se essa opção estiver desligada) e não
+    pela base de quem respondeu o banner, então a soma só
     é 100% se todo mundo do grupo respondeu o banner E cada pessoa cai
     em uma única coluna. Duas situações quebram isso:
       - banner de múltipla escolha: a pessoa conta em 2+ colunas -> soma > 100%;
@@ -152,10 +185,73 @@ def _stacked_sum_note(pct_df: pd.DataFrame, tolerance: float = 1.0) -> str | Non
         return None
     lo, hi = sums.min(), sums.max()
     return (
-        f"⚠️ As barras não fecham em 100% (somam de {lo:.0f}% a {hi:.0f}%). "
+        f"⚠️ As barras não fecham em 100% (somam de {lo:.1f}% a {hi:.1f}%). "
         "Acima de 100%: o banner é de múltipla escolha (a mesma pessoa conta em mais de uma cor). "
         "Abaixo de 100%: nem todo mundo do grupo respondeu o banner (veja a cobertura acima)."
     )
+
+
+def _is_mr_key(meta: dict, key: str) -> bool:
+    """True se `key` é um grupo de múltipla escolha (chave = código do grupo, não coluna)."""
+    return any(m.var_type == VarType.MR_OPTION and m.mr_group == key for m in meta.values())
+
+
+def _prepare_stacked(
+    pct_linha: pd.DataFrame, meta: dict, banner_key: str, banner_label: str, stub_label: str,
+) -> tuple[pd.DataFrame, str | None, str, str]:
+    """
+    Faz as barras do empilhado fecharem 100% SEM mudar nenhum número.
+
+    Histórico (importa pra não repetir): o %LINHA da tabela divide pela
+    base do grupo INTEIRO do stub, que inclui quem não respondeu o banner
+    ou caiu em "N/A" (esses não viram segmento). Então as fatias visíveis
+    somam < 100% (ex.: 77% do ano 2023 respondeu o indicador). Primeiro
+    tentei re-normalizar cada barra pela soma das fatias -- barras fechavam
+    100%, mas os números deixavam de bater com a tabela (BOM 39,3% virava
+    45,6%), e o gráfico perdia a confiança do analista. Agora os valores
+    são exatamente os da tabela e o que falta vira um segmento "Em branco
+    na base" (cinza claro): a barra é 100% do GRUPO, e a lacuna aparece em
+    vez de ser escondida.
+
+    Por que NÃO é uma categoria "N/A": a pergunta pode ter uma categoria
+    real "N/A - Não citou ter visto..." (resposta de verdade, coluna
+    própria, cinza #9E9E9E). A lacuna é outra coisa -- gente do grupo que
+    tem a variável NULA na base, em nenhuma coluna da tabela. Mesmo cinza
+    deixava as duas indistinguíveis (visto em produção, IACOM 2022/2025:
+    6,8% de "N/A" real ao lado de 13,8% de lacuna).
+
+    Desde que a base do %LINHA passou a ser o "universo da pergunta"
+    (`crosstab_engine.infer_question_universe`), grupos onde a pergunta nem
+    existe saem do denominador e não viram lacuna: o que sobra de "Em
+    branco" é não-resposta de verdade dentro do universo. Com a opção
+    desligada (Total inteiro), a lacuna volta a misturar as duas coisas.
+
+    Banner de múltipla escolha NÃO ganha segmento de lacuna: a soma conta
+    menções (passa de 100%), então "o que falta" não tem leitura de
+    pessoas. Fica como está, só com o aviso.
+
+    Retorna (df, nota, título do eixo X, contexto do hover).
+    """
+    axis = f"% dentro de cada grupo de {stub_label}"
+    if _is_mr_key(meta, banner_key):
+        return pct_linha, _stacked_sum_note(pct_linha), axis, "desse grupo"
+
+    gap = (100.0 - pct_linha.sum(axis=1)).clip(lower=0.0)
+    gap = gap.where(gap > 0.05, 0.0)  # sobra de arredondamento não vira segmento
+    if not (gap > 0).any():
+        return pct_linha, None, axis, "desse grupo"
+
+    out = pct_linha.copy()
+    out[_STACKED_GAP_LABEL] = gap
+    note = (
+        f"ℹ️ **Em branco na base** (cinza claro): {gap.min():.1f}% a {gap.max():.1f}% das pessoas de cada grupo "
+        f"não têm valor em {banner_label}, então não entram em nenhuma coluna da tabela. "
+        "É diferente de uma categoria \"N/A - ...\" (essa é uma resposta e tem coluna própria). "
+        "As demais fatias são exatamente os %LINHA da tabela. "
+        "Se parte desse grupo nem foi perguntada (a pergunta não existe pra ela), confira a opção "
+        "\"Base do %LINHA\" na barra lateral."
+    )
+    return out, note, axis, "desse grupo"
 
 
 def _build_stacked_chart(
@@ -192,12 +288,13 @@ def _build_stacked_chart(
     cats = pct_df.index.astype(str)
     for col in pct_df.columns:
         vals = pct_df[col]
-        labels = [f"{v:.0f}%" if v >= _STACKED_MIN_LABEL_PCT else "" for v in vals]
+        labels = [f"{v:.1f}%" if v >= _STACKED_MIN_LABEL_PCT else "" for v in vals]
         fig.add_trace(go.Bar(
             name=str(col), y=cats, x=vals, orientation="h",
-            text=labels, textposition="inside", insidetextanchor="middle",
+            text=labels, textposition="inside", insidetextanchor="middle", textangle=0,
             hovertemplate=f"{col}<br>{category_label}: %{{y}}<br>%{{x:.1f}}% {value_context}<extra></extra>",
-            marker=dict(color=category_color(str(col)), line=dict(color="white", width=1.5)),
+            marker=dict(color=_STACKED_GAP_COLOR if col == _STACKED_GAP_LABEL else category_color(str(col)),
+                        line=dict(color="white", width=1.5)),
         ))
 
     x_max = max(100.0, float(pct_df.sum(axis=1).max())) if len(pct_df) else 100.0
@@ -205,6 +302,12 @@ def _build_stacked_chart(
         barmode="stack",
         bargap=bargap,
         title=title,
+        # Sem isto o Plotly ENCOLHE o texto até caber (segmento de 4% num
+        # painel estreito virava um rótulo minúsculo e ilegível). Com
+        # mode="hide", o rótulo que não cabe em 10px some -- o valor segue
+        # no hover. Complementa o corte fixo de `_STACKED_MIN_LABEL_PCT`,
+        # que não sabe a largura real do gráfico.
+        uniformtext=dict(minsize=10, mode="hide"),
         xaxis=dict(title=value_axis_title, range=[0, x_max], ticksuffix="%"),
         yaxis=dict(autorange="reversed"),
         # traceorder="normal": em barra empilhada o Plotly inverte a ordem
@@ -319,6 +422,38 @@ def _build_chart(
 #  ABA: CRUZAMENTO
 # ══════════════════════════════════════════════════════════════════════
 
+def _render_block_notes(blocks: list) -> None:
+    """
+    Legenda de base + avisos por variável de banner, acima da tabela --
+    compartilhada pela aba Cruzamento e pelos painéis do Comparar (antes
+    cada uma tinha a sua cópia, e a base do %LINHA não aparecia em lugar
+    nenhum).
+
+    Mostra, por banner: quantos responderam, contra QUAL base (a base do
+    %LINHA do bloco, não o Total do stub) e, quando o universo da pergunta
+    tirou gente da base, quem saiu. É essa frase que impede a leitura
+    errada "as barras deveriam fechar 100% do ano inteiro": o ano inteiro
+    inclui gente a quem a pergunta nunca foi feita.
+    """
+    for b in blocks[1:]:
+        own_n = int(b.base_n.sum())
+        base = b.base_people
+        pct = own_n / base * 100 if base else 0
+        st.caption(f"**{b.banner_label}**: resposta de {own_n:,} de {base:,} ({pct:.1f}%) — {describe_block_base(b)}")
+        if b.universe_excluded_groups and len(b.universe_excluded_groups) > 3:
+            with st.expander(f"Ver todos os {len(b.universe_excluded_groups)} recortes fora da base de {b.banner_label}"):
+                st.markdown("\n".join(f"- {name}: {n:,} pessoas" for name, n in b.universe_excluded_groups))
+        if b.coverage_warning:
+            st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
+
+
+def _export_notes(blocks: list, use_weighting: bool) -> list[str]:
+    """Linhas de nota que vão junto do CSV/Excel -- a base de cada %LINHA e a convenção de peso."""
+    notes = [f"{b.banner_label}: {describe_block_base(b)}" for b in blocks[1:]]
+    notes.append("Peso amostral aplicado aos percentuais." if use_weighting else "Percentuais sem peso amostral (contagem bruta).")
+    return notes
+
+
 def _render_cruzamento_tab(
     data: pd.DataFrame,
     meta: dict,
@@ -330,6 +465,7 @@ def _render_cruzamento_tab(
     small_n_threshold: int,
     active_filters: dict,
     use_weighting: bool,
+    use_universe: bool = True,
 ) -> None:
     """
     Desenha a aba de cruzamento inteira: tabela NA/%LINHA/%COLUNA,
@@ -344,7 +480,7 @@ def _render_cruzamento_tab(
         st.warning("Selecione ao menos uma variável de banner na barra lateral.")
         return
 
-    blocks = _build_banner_cached(filtered_data, meta, stub_key, tuple(banner_keys), na_handling, small_n_threshold, use_weighting)
+    blocks = _build_banner_cached(filtered_data, meta, stub_key, tuple(banner_keys), na_handling, small_n_threshold, use_weighting, use_universe)
     if not blocks:
         st.warning(
             "Nenhuma das variáveis de banner selecionadas tem respondente elegível "
@@ -382,13 +518,7 @@ def _render_cruzamento_tab(
         mask = pd.concat([unfiltered_mask, mask], axis=1)
 
     # --- legendas de cobertura por variável de banner ---
-    total_n_ref = blocks[0].base_n["Total"]
-    for b in blocks[1:]:
-        own_n = b.base_n.sum()
-        pct = own_n / total_n_ref * 100 if total_n_ref else 0
-        st.caption(f"**{b.banner_label}**: resposta de {own_n:,} de {total_n_ref:,} ({pct:.1f}%)")
-        if b.coverage_warning:
-            st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
+    _render_block_notes(blocks)
 
     st.subheader(f"{options[stub_key]}")
     if use_weighting:
@@ -405,6 +535,11 @@ def _render_cruzamento_tab(
             "- **Total** — a base inteira do stub (todo mundo, independente da pergunta de banner "
             "escolhida). Nunca é a base específica de uma pergunta — pra isso, veja a legenda "
             "logo acima da tabela (\"resposta de X de Y\").\n"
+            "- **Base do %LINHA** — contra quem o %LINHA é calculado. Por padrão é o *universo da "
+            "pergunta*: grupos onde ela quase não tem resposta (ex.: um índice que não existe numa "
+            "operação) saem da base, pra não contar como \"não respondeu\" quem nunca foi "
+            "perguntado. A legenda acima da tabela diz quem saiu; a chave \"Base do %LINHA\" na "
+            "barra lateral volta ao Total inteiro.\n"
             "- **Total geral (sem filtro)** — só aparece se você aplicou um filtro de base; é o "
             "Total de antes do filtro, pra comparação lado a lado.\n"
             "- **Células em amarelo** — a base ali é menor que o limiar definido na barra lateral; "
@@ -412,7 +547,8 @@ def _render_cruzamento_tab(
             "- **Aviso amarelo acima da tabela** — sinaliza base concentrada numa categoria só do "
             "stub, ou cobertura baixa da pergunta (nem todo mundo respondeu) — não é erro de conta.\n"
             "- Se %LINHA de uma categoria não soma perto de 100%, é sinal de que nem todo mundo "
-            "daquele grupo respondeu a pergunta.\n"
+            "da base respondeu a pergunta (com o universo ligado, isso é não-resposta de verdade; "
+            "com o Total inteiro, pode ser pergunta que nem existia pro grupo).\n"
             "- **%COLUNA pode somar mais de 100%** quando a variável de linha (stub) é de "
             "múltipla resposta: quem marcou 2+ opções é contado em 2+ categorias ao mesmo "
             "tempo, então a soma passa a refletir *menções*, não pessoas. Não é erro de conta "
@@ -485,29 +621,31 @@ def _render_cruzamento_tab(
                 "Espaço dentro do grupo", 0.0, 0.9, 0.1, 0.05,
                 help="Maior = mais separação entre as barras de um mesmo grupo (ex.: entre Ótimo/Bom/Regular lado a lado).",
             )
-    row_totals_weighted = blocks[0].cell_weighted["Total"]  # base ponderada de cada categoria do stub, pro %LINHA
     for b in blocks[1:]:  # blocks[0] é sempre "Total" -- não faz gráfico próprio, já está implícito em cada um dos outros
         # %LINHA: "como esse grupo do stub se distribui nessa pergunta" --
-        # leitura mais natural pra comparar grupos entre si.
-        pct_linha = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
-        pct_linha = pct_linha.fillna(0.0)
+        # leitura mais natural pra comparar grupos entre si. `linha_pct_frame`
+        # é a MESMA função que monta a tabela e a exportação: o gráfico não
+        # recalcula o número, só lê o que a tabela mostra.
+        pct_linha = linha_pct_frame(b, blocks[0]).fillna(0.0)
         # %COLUNA: "quem compõe cada resposta" -- já vem pronto em b.pct.
         pct_coluna = b.pct
 
         if stacked:
+            st_df, note, axis_title, ctx = _prepare_stacked(
+                pct_linha, meta, b.banner_key, b.banner_label, options[stub_key],
+            )
             st.plotly_chart(
                 _build_chart(
-                    pct_linha, chart_type,
+                    st_df, chart_type,
                     title=f"{options[stub_key]} por {b.banner_label} — %LINHA",
-                    value_axis_title=f"% dentro de cada grupo de {options[stub_key]}",
+                    value_axis_title=axis_title,
                     legend_title=b.banner_label,
                     category_label=options[stub_key],
-                    value_context="desse grupo",
+                    value_context=ctx,
                     bargap=bargap, bargroupgap=bargroupgap,
                 ),
                 width='stretch',
             )
-            note = _stacked_sum_note(pct_linha)
             if note:
                 st.caption(note)
             continue
@@ -540,7 +678,10 @@ def _render_cruzamento_tab(
             st.plotly_chart(fig2, width='stretch')
             st.caption("Quem compõe cada resposta — o perfil de quem escolheu cada opção.")
 
-    _render_export_controls(table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix="cruzamento")
+    _render_export_controls(
+        table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix="cruzamento",
+        notes=_export_notes(blocks, use_weighting), extra_signature=(use_weighting, use_universe),
+    )
 
 
 def _render_export_controls(
@@ -551,6 +692,8 @@ def _render_export_controls(
     active_filters: dict,
     na_handling: str,
     key_prefix: str,
+    notes: list[str] | None = None,
+    extra_signature: tuple = (),
 ) -> None:
     """
     Fluxo de exportação (CSV/Excel) com o passo de "preparar antes de
@@ -575,7 +718,11 @@ def _render_export_controls(
     # assinatura simples do estado atual (filtro + stub + banner) -- se mudar
     # desde a última preparação, a exportação anterior fica obsoleta e
     # exigimos recomputar antes de liberar o download de novo.
-    current_signature = (stub_key, tuple(banner_keys), tuple(sorted(active_filters.items())), na_handling)
+    # `extra_signature` carrega as chaves que mudam o NÚMERO sem mudar
+    # stub/banner/filtro (peso amostral, base do %LINHA) -- sem elas, ligar
+    # o peso deixava a exportação antiga marcada como "pronta" e o download
+    # entregava a tabela do estado anterior.
+    current_signature = (stub_key, tuple(banner_keys), tuple(sorted(active_filters.items())), na_handling, extra_signature)
     if st.session_state.get(export_signature_key) != current_signature:
         st.session_state[export_ready_key] = False
 
@@ -596,8 +743,13 @@ def _render_export_controls(
             st.rerun()
         return
 
-    csv_bytes = format_table_for_export(table).to_csv().encode("utf-8")
-    xlsx_bytes = banner_table_to_excel_bytes(table, mask)
+    csv_text = format_table_for_export(table).to_csv()
+    if notes:
+        # Notas depois de uma linha em branco, uma por linha: o CSV circula
+        # sem a tela, então a base do %LINHA precisa viajar junto com os números.
+        csv_text += "\n" + "\n".join(['"Notas"'] + ['"' + n.replace('"', "'") + '"' for n in notes]) + "\n"
+    csv_bytes = csv_text.encode("utf-8")
+    xlsx_bytes = banner_table_to_excel_bytes(table, mask, notes)
     base_name = _crosstab_file_name(stub_key, banner_keys)
 
     with col_csv:
@@ -644,11 +796,9 @@ def _crosstab_file_name(stub_key: str, banner_keys: list[str]) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 _PERSIST_KEY = "_cmp_panel_state"
-"""
-Dict `{persist_key: valor}` fora do namespace de qualquer widget --
-sobrevive independente de qual painel está sendo desenhado neste rerun.
-Ver `_persisted_widget_default`.
-"""
+# Dict `{persist_key: valor}` fora do namespace de qualquer widget --
+# sobrevive independente de qual painel está sendo desenhado neste rerun.
+# Ver `_persisted_widget_default`.
 
 
 def _persisted_widget_default(persist_key: str, options: list, fallback_index: int = 0):
@@ -687,6 +837,7 @@ def _render_comparison_panel(
     use_weighting: bool,
     bargap: float,
     bargroupgap: float,
+    use_universe: bool = True,
 ) -> None:
     """
     Um painel (A, B, C ou D) do modo Comparação -- stub/banner/tipo de
@@ -716,24 +867,43 @@ def _render_comparison_panel(
     st.markdown(f"#### Painel {panel_label}")
 
     stub_options = list(options.keys())
+    # `options` aqui já é a lista SEM as variáveis sem resposta na base
+    # filtrada (ver `_render_sidebar`). Se o filtro mudou e a variável que
+    # este painel tinha escolhida saiu da lista, o valor guardado no widget
+    # deixa de ser uma opção válida -- mesma família do bug de estado do
+    # filtro em cascata. Limpar a chave ANTES de desenhar faz o widget cair
+    # no `index` calculado abaixo (primeira opção, pois o valor persistido
+    # também não está mais em `stub_options`) em vez de quebrar.
+    stub_widget_key = f"{key_prefix}_stub"
+    gone_stub = st.session_state.get(stub_widget_key)
+    if gone_stub is not None and gone_stub not in options:
+        del st.session_state[stub_widget_key]
+        st.caption(f"⚠️ '{gone_stub}' saiu da lista (sem resposta nessa base); linha trocada.")
     stub_key = st.selectbox(
         "Variável de linha (stub)",
         options=stub_options,
         format_func=lambda k: options[k],
         index=_persisted_widget_default(f"{key_prefix}_stub", stub_options),
-        key=f"{key_prefix}_stub",
+        key=stub_widget_key,
     )
     _save_persisted(f"{key_prefix}_stub", stub_key)
 
     banner_options = [k for k in options if k != stub_key]
     saved_banner = st.session_state.get(_PERSIST_KEY, {}).get(f"{key_prefix}_banner", [])
     default_banner = [k for k in saved_banner if k in banner_options]
+    banner_widget_key = f"{key_prefix}_banner"
+    if banner_widget_key in st.session_state:
+        # mesmo motivo do stub acima: valor do widget com opção que saiu da lista
+        st.session_state[banner_widget_key] = [k for k in st.session_state[banner_widget_key] if k in banner_options]
     banner_keys = st.multiselect(
         "Variáveis de banner (colunas)",
         options=banner_options,
         format_func=lambda k: options[k],
-        default=default_banner,
-        key=f"{key_prefix}_banner",
+        # `default=` junto de um valor já escrito no session_state gera aviso do
+        # Streamlit (e o default seria ignorado de qualquer forma) -- só passa
+        # default na primeira vez, quando o widget ainda não tem estado.
+        default=None if banner_widget_key in st.session_state else default_banner,
+        key=banner_widget_key,
     )
     _save_persisted(f"{key_prefix}_banner", banner_keys)
 
@@ -783,7 +953,7 @@ def _render_comparison_panel(
         st.info("Selecione ao menos uma variável de banner pra este painel.")
         return
 
-    blocks = _build_banner_cached(filtered_data, meta, stub_key, tuple(banner_keys), na_handling, small_n_threshold, use_weighting)
+    blocks = _build_banner_cached(filtered_data, meta, stub_key, tuple(banner_keys), na_handling, small_n_threshold, use_weighting, use_universe)
     if not blocks:
         st.warning("Nenhum respondente elegível cruzado nesse conjunto de dados.")
         return
@@ -791,13 +961,7 @@ def _render_comparison_panel(
     table = format_banner_table_full(blocks)
     mask = small_n_mask_full(blocks)
 
-    total_n_ref = blocks[0].base_n["Total"]
-    for b in blocks[1:]:
-        own_n = b.base_n.sum()
-        pct = own_n / total_n_ref * 100 if total_n_ref else 0
-        st.caption(f"**{b.banner_label}**: resposta de {own_n:,} de {total_n_ref:,} ({pct:.1f}%)")
-        if b.coverage_warning:
-            st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
+    _render_block_notes(blocks)
 
     def _highlight_small_n(_: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=table.index, columns=table.columns)
@@ -821,7 +985,6 @@ def _render_comparison_panel(
     # tabela dentro de uma caixa de altura fixa é preferível a isso.
     st.dataframe(styled, width='stretch', height=320)
 
-    row_totals_weighted = blocks[0].cell_weighted["Total"]
     stacked_needs_linha = chart_type == CHART_STACKED and chart_side != "%LINHA"
     if stacked_needs_linha:
         # Em vez de cair em silêncio pra outro tipo (o analista acharia que
@@ -829,10 +992,14 @@ def _render_comparison_panel(
         st.info("Barra empilhada 100% só existe para %LINHA — troque o seletor 📊 Gráfico para %LINHA.")
     for b in ([] if stacked_needs_linha else blocks[1:]):
         if chart_side == "%LINHA":
-            pct_df = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
-            pct_df = pct_df.fillna(0.0)
+            pct_df = linha_pct_frame(b, blocks[0]).fillna(0.0)
             value_axis_title = f"% dentro de cada grupo de {options[stub_key]}"
             value_context = "desse grupo"
+            stacked_note = None
+            if chart_type == CHART_STACKED:
+                pct_df, stacked_note, value_axis_title, value_context = _prepare_stacked(
+                    pct_df, meta, b.banner_key, b.banner_label, options[stub_key],
+                )
         else:
             pct_df = b.pct
             value_axis_title = "% de quem escolheu cada opção"
@@ -848,12 +1015,13 @@ def _render_comparison_panel(
             bargap=bargap, bargroupgap=bargroupgap,
         )
         st.plotly_chart(fig, width='stretch', key=f"{key_prefix}_chart_{b.banner_key}")
-        if chart_type == CHART_STACKED:
-            note = _stacked_sum_note(pct_df)
-            if note:
-                st.caption(note)
+        if chart_type == CHART_STACKED and stacked_note:
+            st.caption(stacked_note)
 
-    _render_export_controls(table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix=key_prefix)
+    _render_export_controls(
+        table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix=key_prefix,
+        notes=_export_notes(blocks, use_weighting), extra_signature=(use_weighting, use_universe),
+    )
 
 
 def _render_comparacao_tab(
@@ -865,6 +1033,7 @@ def _render_comparacao_tab(
     small_n_threshold: int,
     active_filters: dict,
     use_weighting: bool,
+    use_universe: bool = True,
 ) -> None:
     """
     De 2 a 4 cruzamentos independentes num grid 2x2, pra comparação
@@ -952,6 +1121,7 @@ def _render_comparacao_tab(
                 _render_comparison_panel(
                     label, label.lower(), data, filtered_data, meta, options, na_handling,
                     small_n_threshold, active_filters, use_weighting, bargap, bargroupgap,
+                    use_universe,
                 )
         # vaga vazia de N=3: row_columns[1] existe mas não recebe painel
         # nenhum -- a coluna do Streamlit já foi criada e ocupa espaço
@@ -1165,10 +1335,24 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
     `_render_indices_overview`/`_individual`/`_quadrant` conforme
     escolhido.
     """
-    media_map = indicator_media_map(meta)
-    indicator_names = list(media_map.keys())
-    if not indicator_names or not media_map:
+    full_media_map = indicator_media_map(meta)
+    if not full_media_map:
         st.info("Esse banco não tem variáveis de indicador (_c) com companion numérico (_media).")
+        return
+    # Mesma regra das listas de stub/banner: índice sem NENHUM valor na base
+    # filtrada some (ex.: IACOM com OPERACAO = PPPs). Conta o `_media` CRU,
+    # sem a imputação neutra de `indices._NEUTRAL_IMPUTATION` -- ela preenche
+    # nota 3 pra todo mundo sem valor e faria o IACOM parecer ter dado em PPPs.
+    media_map = {
+        ind: col for ind, col in full_media_map.items()
+        if pd.to_numeric(get_column_series(filtered_data, col), errors="coerce").notna().any()
+    }
+    hidden_indices = [i for i in full_media_map if i not in media_map]
+    if hidden_indices:
+        st.caption(f"🙈 Índices ocultos (nenhum valor nessa base): {', '.join(hidden_indices)}.")
+    indicator_names = list(media_map.keys())
+    if not indicator_names:
+        st.info("Nenhum índice tem valor nessa base. Ajuste o filtro de base.")
         return
 
     segment_options = [k for k, m in meta.items() if m.var_type == VarType.SR and k in options]
@@ -1248,16 +1432,14 @@ _DEMOGRAFIA_MEDIA: dict[str, str] = {
     "P50_media": "Nº de moradores",
     "P50.1_media": "Nº de crianças",
 }
-"""
-Companions `_media` que são demografia, não índice de satisfação --
-mesmo padrão de nome (`_media`, dtype numérico) dos 15 índices, mas em
-escala completamente diferente (idade vai de ~18 a ~90, não de 1 a 5).
-Descobertos vasculhando as 128 colunas `_media` do banco -- só 15 
-viram índice oficial, o resto são sub-itens ou perguntas soltas como
-essas 3. Ficam fora de `indicator_media_map`/`_binned_media_counts` de
-propósito (o binning de 1 a 5 não faz sentido pra idade), e entram
-aqui como lista separada, com rótulo pra exibição em vez do nome cru.
-"""
+# Companions `_media` que são demografia, não índice de satisfação --
+# mesmo padrão de nome (`_media`, dtype numérico) dos 15 índices, mas em
+# escala completamente diferente (idade vai de ~18 a ~90, não de 1 a 5).
+# Descobertos vasculhando as 128 colunas `_media` do banco -- só 15
+# viram índice oficial, o resto são sub-itens ou perguntas soltas como
+# essas 3. Ficam fora de `indicator_media_map`/`_binned_media_counts` de
+# propósito (o binning de 1 a 5 não faz sentido pra idade), e entram
+# aqui como lista separada, com rótulo pra exibição em vez do nome cru.
 
 
 def _render_boxplot_secao(base: pd.DataFrame, meta: dict) -> None:
@@ -1389,13 +1571,22 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
 #  BARRA LATERAL
 # ══════════════════════════════════════════════════════════════════════
 
-def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.DataFrame, str, list[str], str, int, dict, bool]:
+def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.DataFrame, str, list[str], str, int, dict, bool, bool, dict]:
     """
     Monta a barra lateral inteira (filtro de base, seleção de stub/
     banner, regras) e já aplica o filtro escolhido, devolvendo tudo que
     `main()` precisa pra chamar as duas abas:
 
-        (filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters)
+        (filtered_data, stub_key, banner_keys, na_handling, small_n_threshold,
+         active_filters, use_weighting, use_universe, visible_options)
+
+    `visible_options` é `options` sem as variáveis que não têm NENHUMA
+    resposta na base já filtrada -- é o que alimenta as listas de stub e
+    banner (aqui e nas abas), pra ninguém escolher uma pergunta que não
+    existe no recorte (ex.: IACOM com OPERACAO = PPPs). O seletor do
+    próprio filtro de base continua com a lista completa: filtrar por uma
+    variável não depende de ela ter resposta no recorte anterior (a
+    cascata já mostra só os valores que sobraram).
 
     O filtro de base é aplicado ANTES de qualquer cruzamento -- é só um
     recorte de linhas do df. Nada em `crosstab_engine.py` precisa saber
@@ -1461,15 +1652,55 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
             cascading_data = cascading_data[col.isin(chosen)] if chosen else cascading_data.iloc[0:0]
 
         st.header("2. Cruzamento")
+        # Só variáveis com resposta na base filtrada. `cascading_data` já é a
+        # base depois de todos os filtros; a assinatura (filtros em ordem)
+        # é a chave do cache de `_visible_keys_cached`.
+        if cascading_data.empty:
+            st.warning("O filtro de base zerou a amostra. Ajuste as seleções na barra lateral.")
+            st.stop()
+        filters_signature = tuple((fk, tuple(map(str, chosen))) for fk, chosen in active_filters.items())
+        visible_set = set(_visible_keys_cached(filters_signature, cascading_data, meta, tuple(options.keys())))
+        visible_options = {k: label for k, label in options.items() if k in visible_set}
+        hidden = [k for k in options if k not in visible_set]
+        if hidden:
+            st.caption(f"🙈 {len(hidden)} variáveis ocultas: nenhuma resposta nessa base.")
+            with st.expander("Ver quais"):
+                st.markdown("\n".join(f"- {options[k]}" for k in hidden))
+        if not visible_options:
+            st.warning("Nenhuma variável tem resposta nessa base. Ajuste o filtro de base.")
+            st.stop()
+
+        # `key=` explícito + correção do estado ANTES de desenhar. Sem isso, cada
+        # mudança de filtro que escondesse/mostrasse uma variável mudava a
+        # lista de opções -- e o Streamlit trata widget sem key com opções
+        # diferentes como OUTRO widget, voltando stub pra primeira variável e
+        # esvaziando o banner a cada clique no filtro. Com key, o valor
+        # sobrevive; o que precisa de cuidado é o valor que saiu da lista
+        # (inválido), tratado aqui explicitamente e avisado ao analista.
+        stub_options = list(visible_options.keys())
+        prev_stub = st.session_state.get("sb_stub")
+        if prev_stub is not None and prev_stub not in visible_options:
+            st.session_state["sb_stub"] = stub_options[0]
+            st.caption(f"⚠️ '{options.get(prev_stub, prev_stub)}' não tem resposta nessa base; linha trocada para '{options[stub_options[0]]}'.")
         stub_key = st.selectbox(
             "Variável de linha (stub)",
-            options=list(options.keys()),
-            format_func=lambda k: options[k],
+            options=stub_options,
+            format_func=lambda k: visible_options[k],
+            key="sb_stub",
         )
+        banner_options = [k for k in visible_options if k != stub_key]
+        prev_banner = st.session_state.get("sb_banner")
+        if prev_banner is not None:
+            kept = [k for k in prev_banner if k in banner_options]
+            if kept != prev_banner:
+                lost = [options.get(k, k) for k in prev_banner if k not in banner_options]
+                st.session_state["sb_banner"] = kept
+                st.caption(f"⚠️ Saiu(ram) do banner (sem resposta nessa base, ou virou o stub): {', '.join(lost)}.")
         banner_keys = st.multiselect(
             "Variáveis de banner (colunas)",
-            options=[k for k in options if k != stub_key],
-            format_func=lambda k: options[k],
+            options=banner_options,
+            format_func=lambda k: visible_options[k],
+            key="sb_banner",
         )
 
         st.header("3. Regras")
@@ -1485,6 +1716,21 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
                 "ele não foi recalibrado pra esse subgrupo menor. Ligue só se você "
                 "sabe que precisa do peso mesmo dentro do recorte atual -- ex.: "
                 "comparando o recorte contra o total nacional lado a lado."
+            ),
+        )
+        use_universe = st.toggle(
+            "Base do %LINHA = universo da pergunta",
+            value=True,
+            help=(
+                "Ligado (padrão): o %LINHA de cada banner divide só por quem estava num grupo "
+                "onde aquela pergunta existe. Exemplo: o índice IACOM não existe em PPPs; com "
+                "isso ligado, os ~20 mil de PPPs saem do denominador e as barras de cada ano "
+                "fecham 100%. Desligado: volta ao Total inteiro do stub -- quem nunca foi "
+                "perguntado entra como 'não respondeu' e a soma fica abaixo de 100%. "
+                "A regra é automática: um grupo (ex.: uma operação, um ano, ano x UF) sai da "
+                "base se menos de 5% dele respondeu a pergunta e ela tem resposta em outros "
+                "grupos. Ela não conhece o desenho do questionário -- a legenda acima da "
+                "tabela mostra exatamente quem saiu, e vale conferir."
             ),
         )
         na_handling = st.radio(
@@ -1517,7 +1763,7 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
             st.warning("O filtro de base zerou a amostra. Ajuste as seleções na barra lateral.")
             st.stop()
 
-    return filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting
+    return filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting, use_universe, visible_options
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1546,7 +1792,10 @@ def main() -> None:
         f"({n_mr} são blocos de múltipla resposta, unpivotados automaticamente)."
     )
 
-    filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting = _render_sidebar(data, meta, options)
+    (
+        filtered_data, stub_key, banner_keys, na_handling, small_n_threshold,
+        active_filters, use_weighting, use_universe, visible_options,
+    ) = _render_sidebar(data, meta, options)
 
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
@@ -1555,11 +1804,11 @@ def main() -> None:
         ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "🩺 Diagnóstico de dados"]
     )
     with tab_cruzamento:
-        _render_cruzamento_tab(data, meta, options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting)
+        _render_cruzamento_tab(data, meta, visible_options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting, use_universe)
     with tab_comparacao:
-        _render_comparacao_tab(data, meta, options, filtered_data, na_handling, small_n_threshold, active_filters, use_weighting)
+        _render_comparacao_tab(data, meta, visible_options, filtered_data, na_handling, small_n_threshold, active_filters, use_weighting, use_universe)
     with tab_indices:
-        _render_indices_tab(data, meta, options, filtered_data)
+        _render_indices_tab(data, meta, visible_options, filtered_data)
     with tab_dados:
         _render_dados_tab(data, meta, filtered_data)
 

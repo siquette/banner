@@ -27,7 +27,7 @@ Depois disso, cruzar qualquer combinação SR x SR, SR x MR, MR x MR é o
 mesmo merge + groupby, porque os dois lados já estão no mesmo formato. É
 essa normalização que elimina o retrabalho manual por pergunta.
 
-DUAS CONVENÇÕES ESTATÍSTICAS FIXADAS AQUI, E O PORQUÊ
+TRÊS CONVENÇÕES ESTATÍSTICAS FIXADAS AQUI, E O PORQUÊ
 ---------------------------------------------------------
 1. Percentual usa peso (PESO), mas "Base Amostra"/NA reporta N não
    ponderado. É o padrão de mercado: o peso corrige a leitura do %, mas
@@ -43,6 +43,17 @@ DUAS CONVENÇÕES ESTATÍSTICAS FIXADAS AQUI, E O PORQUÊ
    funciona como o marcador de "perguntado e respondeu nada", e a base
    fica correta automaticamente.
 
+3. A base do %LINHA é o "universo da pergunta de banner", não o Total
+   do stub. O banco junta anos/operações e uma pergunta muitas vezes NÃO
+   EXISTE pra um desses grupos (ex.: IACOM em PPPs). Esse vazio estrutural
+   não é não-resposta: dividir por ele fazia o %LINHA não fechar 100% sem
+   nenhuma pista do porquê. `infer_question_universe` tira da base os
+   grupos onde a pergunta quase não tem resposta (< 5%), mas mantém quem
+   foi perguntado e não respondeu -- esse vazio é real e continua
+   visível. A regra é mecânica (não conhece o questionário), então a base
+   usada vai escrita em `BannerBlock.universe_note` e `use_universe=False`
+   restaura o Total inteiro.
+
 ADVERTÊNCIA CONHECIDA -- STUB DE MÚLTIPLA RESPOSTA
 ------------------------------------------------------
 Quando a variável de STUB (linha) é MR, uma pessoa com 2+ seleções conta
@@ -55,6 +66,7 @@ mas é diferente do caso comum (stub de resposta única, onde tudo soma
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -272,6 +284,62 @@ def eligible_respondents(
     return data.index[mask]
 
 
+def variables_with_data(
+    data: pd.DataFrame,
+    meta: dict[str, VariableMeta],
+    keys: list[str],
+    na_handling: str = "keep",
+) -> set[str]:
+    """
+    Subconjunto de `keys` (variáveis cruzáveis: SR, indicador ou código de
+    bloco MR) que têm PELO MENOS UM respondente elegível em `data`.
+
+    Existe pra esconder, nas listas de stub/banner, perguntas que não têm
+    nenhuma resposta no recorte atual (ex.: com OPERACAO = PPPs, os índices
+    IACOM, IMC... somem -- não existem em PPPs). Usa a mesma definição de
+    "elegível" de `eligible_respondents` (inclusive `na_handling='exclude'`
+    para indicadores), de modo que "aparece na lista" e "o cruzamento tem
+    base" nunca discordem. Vetorizado por tipo de coluna em vez de chamar
+    `eligible_respondents` variável a variável -- essa função roda a cada
+    mudança de filtro, com centenas de variáveis.
+    """
+    mr_cols: dict[str, list[str]] = {}
+    for m in meta.values():
+        if m.var_type == VarType.MR_OPTION and m.mr_group is not None:
+            mr_cols.setdefault(m.mr_group, []).append(m.name)
+
+    result: set[str] = set()
+    plain_keys, plain_cols = [], []
+    for key in keys:
+        if key in mr_cols:
+            continue
+        m = meta[key]
+        if m.var_type == VarType.INDICATOR and na_handling == "exclude":
+            values = _get_series(data, m.name).dropna().unique()
+            if any(re.match(_NA_TEXT_PATTERN, str(v), flags=re.IGNORECASE) is None for v in values):
+                result.add(key)
+        else:
+            plain_keys.append(key)
+            plain_cols.append(m.name)
+
+    if plain_cols:
+        has_any = data[plain_cols].notna().any(axis=0)
+        # nomes duplicados no df (sufixo __dupN evita, mas não custa proteger): alinha por posição
+        result.update(k for k, flag in zip(plain_keys, has_any.to_numpy()) if flag)
+
+    for key in keys:
+        if key in mr_cols:
+            cols = mr_cols[key]
+            block = data[cols]
+            if all(pd.api.types.is_bool_dtype(block[c]) for c in cols):
+                found = bool(block.to_numpy().any())
+            else:
+                found = any(bool(_mr_selected_mask(_get_series(data, c)).any()) for c in cols)
+            if found:
+                result.add(key)
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  ESTRUTURA DE RESULTADO
 # ══════════════════════════════════════════════════════════════════════
@@ -293,6 +361,153 @@ class BannerBlock:
     base_n: pd.Series              # N não ponderado por categoria do banner
     small_n_flag: pd.Series        # True onde base_n < limiar
     coverage_warning: str | None = None  # ver _check_coverage / _check_base_coverage
+    # --- base do %LINHA (ver `infer_question_universe`) ---------------------
+    # Denominador do %LINHA DESTE bloco, por categoria do stub. É guardado
+    # no próprio bloco (e não recalculado a partir do Total em cada lugar
+    # que desenha tabela/gráfico/export) pra que tabela, gráfico e CSV
+    # nunca possam divergir: todos leem `linha_pct_frame`.
+    row_base_weighted: pd.Series | None = None   # N ponderado da base, por categoria do stub
+    row_base_n: pd.Series | None = None          # N não ponderado (pessoas distintas), por categoria do stub
+    universe_applied: bool = False               # True = base reduzida ao "universo da pergunta"
+    universe_excluded_n: int = 0                 # pessoas fora da base por a pergunta não existir pro grupo delas
+    universe_note: str | None = None             # texto pronto ("Base do %LINHA: ... exclui ...") ou None
+    universe_excluded_groups: list[tuple[str, int]] | None = None  # lista completa (grupo, pessoas) pra quem quer detalhe
+    base_people: int = 0                         # pessoas DISTINTAS na base do %LINHA (diferente de row_base_n.sum() quando o stub é MR)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  UNIVERSO DA PERGUNTA (BASE DO %LINHA)
+# ══════════════════════════════════════════════════════════════════════
+# O problema que isto resolve: o banco junta vários anos/operações, e uma
+# pergunta frequentemente NÃO EXISTE pra um desses grupos (ex.: o índice
+# IACOM não existe em PPPs). Quem não foi perguntado aparece como "vazio"
+# no banco, igual a quem foi perguntado e não respondeu -- mas são coisas
+# diferentes pra leitura: o primeiro não é resposta faltando, é pergunta
+# que não existiu. Se o %LINHA divide pelo grupo inteiro, esses "vazios
+# estruturais" entram no denominador e as barras/linhas não fecham 100%,
+# sem nenhuma pista do porquê.
+#
+# A regra é mecânica de propósito (o app não conhece o desenho dos
+# questionários -- ver `infer_question_universe`): um grupo (ex.:
+# OPERACAO=PPPs) é "fora do universo" se a pergunta tem resposta em
+# outros grupos do MESMO tipo de recorte mas quase nenhuma nesse.
+
+UNIVERSE_KEYS_DEFAULT: tuple[str, ...] = ("ANO", "OPERACAO", "UF", "DIRETORIA", "REGIONAL", "PUBLICO")
+"""
+Colunas que definem "grupo" pra decidir onde uma pergunta existe. Cada
+uma é testada sozinha e, quando `_UNIVERSE_PAIR_KEY` está entre elas, também
+cruzada com ela (ANO x OPERACAO, ANO x UF...) -- o desenho do estudo costuma
+mudar de uma onda pra outra (pergunta que existiu só em 2023 em uma
+operação), e uma chave sozinha não enxerga isso. Colunas que não existem
+no banco carregado são ignoradas.
+"""
+_UNIVERSE_PAIR_KEY = "ANO"
+_UNIVERSE_MAX_COVERAGE = 0.05  # abaixo disso (% de pessoas com resposta no grupo) = pergunta não existe ali
+_UNIVERSE_MIN_GROUP_N = 30     # grupo menor que isso não é julgado (pouca gente pra concluir qualquer coisa)
+
+
+@dataclass
+class _KeyGroups:
+    """Um tipo de recorte (ex.: OPERACAO, ou ANO x UF): código de grupo por linha + como descrevê-lo."""
+    names: tuple[str, ...]
+    codes: np.ndarray            # int64 por linha; -1 = alguma chave do recorte é nula
+    sizes: np.ndarray            # nº de pessoas de cada grupo (índice = código)
+    categories: list[list]       # categorias de cada chave, na ordem de `names`
+
+    def describe(self, code: int) -> str:
+        """Texto legível do grupo -- ex.: "OPERACAO = PPPs" ou "ANO = 2022 e UF = BAHIA"."""
+        parts, rest = [], int(code)
+        for name, cats in zip(reversed(self.names), reversed(self.categories)):
+            rest, idx = divmod(rest, len(cats))
+            parts.append(f"{name} = {cats[idx]}")
+        return " e ".join(reversed(parts))
+
+
+def build_universe_key_groups(data: pd.DataFrame, universe_keys: tuple[str, ...] | None = None) -> list[_KeyGroups]:
+    """
+    Pré-calcula os códigos de grupo das chaves de universo. Separado de
+    `infer_question_universe` pra ser feito UMA vez por `build_banner` e
+    reaproveitado por todas as variáveis de banner (a parte cara é
+    fatorizar as colunas-chave, não testar cada pergunta).
+    """
+    keys = [k for k in (universe_keys or UNIVERSE_KEYS_DEFAULT) if k in data.columns]
+    coded: dict[str, tuple[np.ndarray, list]] = {}
+    for k in keys:
+        cat = _get_series(data, k).astype("category")
+        coded[k] = (cat.cat.codes.to_numpy().astype(np.int64), list(cat.cat.categories))
+
+    key_sets: list[tuple[str, ...]] = [(k,) for k in keys]
+    if _UNIVERSE_PAIR_KEY in keys:
+        key_sets += [(_UNIVERSE_PAIR_KEY, k) for k in keys if k != _UNIVERSE_PAIR_KEY]
+
+    groups = []
+    for names in key_sets:
+        codes, cats_list, invalid = None, [], None
+        for name in names:
+            c, cats = coded[name]
+            cats_list.append(cats)
+            if codes is None:
+                codes, invalid = c.copy(), c < 0
+            else:
+                codes = codes * max(len(cats), 1) + c
+                invalid |= c < 0
+        if codes is None:
+            continue
+        codes[invalid] = -1
+        n_groups = int(np.prod([max(len(c), 1) for c in cats_list]))
+        sizes = np.bincount(codes[codes >= 0], minlength=n_groups)
+        groups.append(_KeyGroups(names=names, codes=codes, sizes=sizes, categories=cats_list))
+    return groups
+
+
+def infer_question_universe(
+    key_groups: list[_KeyGroups],
+    eligible_mask: np.ndarray,
+) -> tuple[np.ndarray, list[tuple[str, int]]]:
+    """
+    "Onde essa pergunta existe?" -- devolve (máscara do universo, grupos
+    excluídos com a contagem de pessoas que cada um tirou).
+
+    Regra (mecânica, sem conhecer o questionário): em cada tipo de recorte
+    (OPERACAO, ANO, ANO x UF...), um grupo com >= 30 pessoas e MENOS de 5%
+    de resposta é considerado "a pergunta não existe aqui" -- MAS só se
+    houver pelo menos um outro grupo do mesmo recorte onde ela tem
+    cobertura >= 5%. Sem essa condição, uma pergunta condicional que só ~3%
+    de TODO MUNDO responde (ex.: "motivo de não conectar") teria todos os
+    grupos "excluídos" e o universo viraria "só quem respondeu", o que é
+    uma base legítima mas não é o que este aviso diz.
+
+    Quem respondeu a pergunta NUNCA sai do universo, mesmo num grupo
+    excluído -- senão o numerador de uma célula poderia passar do
+    denominador (%LINHA > 100%).
+
+    Limite assumido (documentado, não escondido): o que distingue "pergunta
+    não existe no grupo" de "pouca gente respondeu" é o corte de 5%. Uma
+    pergunta que existe mas quase ninguém responde num grupo seria tratada
+    como inexistente. O app mostra quem foi tirado da base e permite voltar
+    ao Total inteiro, justamente por isso.
+    """
+    n = len(eligible_mask)
+    excluded = np.zeros(n, dtype=bool)
+    parts: list[tuple[str, int]] = []
+    for g in key_groups:
+        valid = g.codes >= 0
+        n_groups = len(g.sizes)
+        elig_counts = np.bincount(g.codes[valid & eligible_mask], minlength=n_groups)
+        judged = g.sizes >= _UNIVERSE_MIN_GROUP_N
+        has_data = judged & (elig_counts >= _UNIVERSE_MAX_COVERAGE * g.sizes)
+        absent = judged & ~has_data
+        if not absent.any() or not has_data.any():
+            continue
+        safe_codes = np.where(valid, g.codes, 0)
+        newly = valid & absent[safe_codes] & ~excluded & ~eligible_mask
+        if not newly.any():
+            continue
+        per_group = np.bincount(g.codes[newly], minlength=n_groups)
+        for code in np.flatnonzero(per_group):
+            parts.append((g.describe(int(code)), int(per_group[code])))
+        excluded |= newly
+    return ~excluded, parts
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -336,31 +551,71 @@ def _check_coverage(stub_long_filtered: pd.DataFrame, stub_label: str, threshold
     return None
 
 
-def _check_base_coverage(banner_n: int, total_n: int, threshold: float = 0.9) -> str | None:
+def _check_base_coverage(
+    banner_n: int,
+    base_n: int,
+    threshold: float = 0.9,
+    universe_applied: bool = False,
+) -> str | None:
     """
     Segundo tipo de aviso, diferente de `_check_coverage`: não é a base
     estar concentrada num balde só do stub, é a base elegível pra essa
-    variável de banner ser bem menor que o Total da tabela -- geralmente
-    lógica de pulo (a pergunta não foi feita pra todo mundo). Achado
-    real: "utiliza água de poço" tinha base de 64.216 contra Total de
-    85.201 (75,4%) -- sem esse aviso, só dava pra perceber somando a
-    linha Base Amostra na mão, que foi exatamente como esse caso
-    apareceu.
+    variável de banner ser bem menor que a base contra a qual o %LINHA é
+    calculado -- ou porque a pergunta não foi feita pra todo mundo, ou
+    porque parte de quem foi perguntado não respondeu. Achado real: "utiliza
+    água de poço" tinha base de 64.216 contra Total de 85.201 (75,4%) --
+    sem esse aviso, só dava pra perceber somando a linha Base Amostra na
+    mão, que foi exatamente como esse caso apareceu.
+
+    O texto depende de `universe_applied` porque a MESMA cobertura baixa
+    significa coisas diferentes: com o universo aplicado, os grupos onde a
+    pergunta nem existe já saíram da base, então o que sobra é não-resposta
+    de verdade; sem ele, a base é o Total inteiro e o aviso precisa dizer
+    que o %LINHA também usa esse Total (a versão anterior afirmava que "os
+    percentuais estão certos", o que era falso pro %LINHA nesse caso).
 
     Texto em linguagem simples de propósito -- "lógica de pulo" é jargão
     de quem constrói questionário, não de quem lê o banner.
     """
-    if total_n <= 0:
+    if base_n <= 0:
         return None
-    coverage = banner_n / total_n
-    if coverage < threshold:
+    coverage = banner_n / base_n
+    if coverage >= threshold:
+        return None
+    if universe_applied:
         return (
-            f"Só {banner_n} de {total_n} pessoas do Total responderam essa "
-            f"pergunta ({coverage:.0%}) -- provavelmente ela não foi feita "
-            f"pra todo mundo. Os percentuais estão certos, só valem pra "
-            f"esse grupo menor, não pro Total inteiro."
+            f"Dentro dos grupos onde essa pergunta existe, só {_format_br_number(banner_n, 0)} de {_format_br_number(base_n, 0)} "
+            f"pessoas responderam ({coverage:.0%}). Quem não respondeu continua na base: "
+            f"no %LINHA aparece como a parte que falta pra 100%. O %COLUNA vale só pra "
+            f"quem respondeu."
         )
-    return None
+    return (
+        f"Só {_format_br_number(banner_n, 0)} de {_format_br_number(base_n, 0)} pessoas do Total responderam essa "
+        f"pergunta ({coverage:.0%}) -- provavelmente ela não foi feita "
+        f"pra todo mundo. O %LINHA usa o Total inteiro como base (por isso "
+        f"não fecha 100% entre as colunas); o %COLUNA vale só pra quem respondeu."
+    )
+
+
+def _universe_note(excluded_parts: list[tuple[str, int]], base_n: int, max_items: int = 3) -> str | None:
+    """
+    Texto da base do %LINHA quando o universo tirou gente: quantas pessoas
+    ficaram, quem saiu e por quê. `None` se ninguém saiu (nada a explicar).
+    Os `max_items` maiores grupos aparecem pelo nome; o resto vira
+    "e mais N recortes" -- a lista completa fica em
+    `BannerBlock.universe_excluded_n` / não cabe numa legenda.
+    """
+    if not excluded_parts:
+        return None
+    total_out = sum(c for _, c in excluded_parts)
+    ordered = sorted(excluded_parts, key=lambda x: -x[1])
+    shown = ", ".join(f"{name} ({_format_br_number(c, 0)})" for name, c in ordered[:max_items])
+    more = f" e mais {len(ordered) - max_items} recorte(s)" if len(ordered) > max_items else ""
+    return (
+        f"Base do %LINHA: {_format_br_number(base_n, 0)} pessoas. Fora da base "
+        f"({_format_br_number(total_out, 0)}): {shown}{more} -- grupos onde essa "
+        f"pergunta quase não tem resposta (menos de 5%), ou seja, provavelmente não foi feita."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -376,6 +631,7 @@ def _build_single_block(
     na_handling: str,
     small_n_threshold: int,
     total_n: int,
+    key_groups: list[_KeyGroups] | None = None,
 ) -> BannerBlock:
     """
     Cruza UMA variável de banner contra o stub. Chamada uma vez por
@@ -395,6 +651,11 @@ def _build_single_block(
        hora do cruzamento em si.
     4. Agrupa por par de categoria (stub, banner) pra somar peso (%) e
        contar distinto (NA).
+    5. Define a BASE DO %LINHA (`row_base_weighted`): por padrão, o Total
+       do stub; com `key_groups` (universo ligado), só quem está nos grupos
+       onde a pergunta de banner existe -- ver `infer_question_universe`.
+       Quem está no universo mas não respondeu o banner continua na base
+       (não-resposta de verdade fica visível, não é escondida).
     """
     stub_long = to_long(data, meta, stub_key, weights, na_handling)
     banner_long = to_long(data, meta, banner_key, weights, na_handling)
@@ -435,7 +696,34 @@ def _build_single_block(
     pct = cell_table.divide(base_weighted, axis=1) * 100
     pct = pct.fillna(0.0)
 
-    coverage_warning = _check_coverage(stub_long, get_label(meta, stub_key)) or _check_base_coverage(len(both_elig), total_n)
+    # --- base do %LINHA ---------------------------------------------------
+    # stub_long_all: TODO elegível do stub (antes de exigir resposta no
+    # banner) -- o %LINHA divide por ele, não por `stub_long` (que já foi
+    # cortado em `both_elig` acima e faria toda linha somar 100% por
+    # construção, escondendo a não-resposta).
+    stub_long_all = to_long(data, meta, stub_key, weights, na_handling)
+    stub_long_all = stub_long_all[stub_long_all.resp_id.isin(stub_elig)]
+    universe_excluded_n, universe_note, excluded_groups = 0, None, None
+    if key_groups is not None:
+        elig_mask = data.index.isin(banner_elig)
+        in_universe, excluded_parts = infer_question_universe(key_groups, elig_mask)
+        universe_ids = data.index[in_universe]
+        stub_long_all = stub_long_all[stub_long_all.resp_id.isin(universe_ids)]
+        stub_ids_all = stub_elig.intersection(universe_ids)
+        universe_excluded_n = len(stub_elig) - len(stub_ids_all)
+        base_people = len(stub_ids_all)
+        if universe_excluded_n > 0:
+            excluded_groups = sorted(excluded_parts, key=lambda x: -x[1])
+            universe_note = _universe_note(excluded_groups, base_people)
+    else:
+        base_people = total_n
+    row_base_weighted = stub_long_all.groupby("category")["weight"].sum()
+    row_base_n = stub_long_all.groupby("category")["resp_id"].nunique()
+
+    coverage_warning = (
+        _check_coverage(stub_long, get_label(meta, stub_key))
+        or _check_base_coverage(len(both_elig), base_people, universe_applied=key_groups is not None)
+    )
 
     return BannerBlock(
         banner_key=banner_key,
@@ -446,6 +734,13 @@ def _build_single_block(
         base_n=base_n.reindex(pct.columns).fillna(0).astype(int),
         small_n_flag=(base_n.reindex(pct.columns).fillna(0) < small_n_threshold),
         coverage_warning=coverage_warning,
+        row_base_weighted=row_base_weighted,
+        row_base_n=row_base_n,
+        universe_applied=key_groups is not None,
+        universe_excluded_n=universe_excluded_n,
+        universe_note=universe_note,
+        universe_excluded_groups=excluded_groups,
+        base_people=base_people,
     )
 
 
@@ -457,6 +752,8 @@ def build_banner(
     na_handling: str = "keep",
     small_n_threshold: int = 30,
     use_weighting: bool = False,
+    use_universe: bool = True,
+    universe_keys: tuple[str, ...] | None = None,
 ) -> list[BannerBlock]:
     """
     Ponto de entrada principal do motor -- é a única função deste módulo
@@ -484,8 +781,17 @@ def build_banner(
     AMAZONAS/PROPRIA=72,9%) e o app (ponderado, 95,0%) apareceu, com o
     mesmo NA em ambos. `True` fica disponível como opção explícita do
     analista, não como padrão.
+
+    `use_universe`: default True -- a base do %LINHA de cada bloco é o
+    "universo da pergunta de banner" (grupos onde ela tem resposta), não o
+    Total inteiro do stub. É o que impede uma pergunta que não existe pra
+    um grupo (ex.: IACOM em PPPs) de entrar no denominador como se fosse
+    não-resposta. `False` restaura o Total inteiro (comportamento antigo).
+    Ver `infer_question_universe` pra regra e limites. `universe_keys`
+    sobrescreve `UNIVERSE_KEYS_DEFAULT`.
     """
     weights = get_weights(data, meta, use_weighting=use_weighting)
+    key_groups = build_universe_key_groups(data, universe_keys) if use_universe else None
 
     total_meta_key = "__TOTAL__"
     blocks = []
@@ -518,6 +824,9 @@ def build_banner(
         cell_weighted=total_cell.reindex(total_pct.index).fillna(0.0).to_frame("Total"),
         base_n=pd.Series({"Total": total_base_pairs["resp_id"].nunique()}),
         small_n_flag=pd.Series({"Total": total_base_pairs["resp_id"].nunique() < small_n_threshold}),
+        row_base_weighted=total_cell.reindex(total_pct.index).fillna(0.0),
+        row_base_n=total_cell_n.reindex(total_pct.index).fillna(0).astype(int),
+        base_people=int(total_base_pairs["resp_id"].nunique()),
     )
     blocks.append(total_block)
 
@@ -525,6 +834,7 @@ def build_banner(
         block = _build_single_block(
             data, meta, stub_key, bk, weights, na_handling, small_n_threshold,
             total_n=total_base_pairs["resp_id"].nunique(),
+            key_groups=key_groups,
         )
         if block.pct.empty:
             # Acontece quando a variável de banner não tem nenhum
@@ -542,6 +852,45 @@ def build_banner(
 #  FORMATAÇÃO DE SAÍDA
 # ══════════════════════════════════════════════════════════════════════
 
+def linha_pct_frame(block: BannerBlock, total_block: BannerBlock) -> pd.DataFrame:
+    """
+    %LINHA de UM bloco -- ÚNICA fonte desse número pra tabela, gráfico e
+    exportação (antes cada um refazia `cell_weighted / Total`, três cópias
+    da mesma conta que podiam divergir). O denominador é a base do próprio
+    bloco (`row_base_weighted`: universo da pergunta quando ligado, Total
+    do stub quando não); blocos sem esse campo caem no Total.
+
+    Células sem base viram NaN (não 0): quem chama decide como mostrar.
+    """
+    denom = block.row_base_weighted if block.row_base_weighted is not None else total_block.cell_weighted["Total"]
+    frame = block.cell_weighted.divide(denom, axis=0) * 100
+    return frame.replace([np.inf, -np.inf], np.nan)
+
+
+def _base_sample_denominator(block: BannerBlock, total_block: BannerBlock) -> float:
+    """Denominador (N não ponderado, somado nas categorias do stub, igual ao numerador `base_na`) da linha "Base Amostra"."""
+    base = block.row_base_n if block.row_base_n is not None else total_block.cell_n["Total"]
+    return float(base.sum())
+
+
+def describe_block_base(block: BannerBlock) -> str:
+    """
+    Frase única sobre a base do %LINHA de um bloco de banner -- usada na
+    tela (legenda acima da tabela) e nas notas das exportações, pra que
+    quem abre o CSV/Excel depois, sem a tela, saiba contra quem o %LINHA
+    foi calculado. Lista os grupos que ficaram de fora quando há (o
+    detalhe completo está em `block.universe_excluded_groups`).
+    """
+    if not block.universe_applied:
+        return f"Base do %LINHA: Total inteiro ({_format_br_number(block.base_people, 0)} pessoas)."
+    if block.universe_note:
+        return block.universe_note
+    return (
+        f"Base do %LINHA: {_format_br_number(block.base_people, 0)} pessoas "
+        f"(a pergunta existe em todos os grupos; ninguém foi tirado da base)."
+    )
+
+
 def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     """
     Monta a tabela completa pra exibição -- NA (contagem não ponderada),
@@ -558,7 +907,6 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     """
     total_block = blocks[0]
     stub_categories = list(total_block.pct.index)
-    row_totals_weighted = total_block.cell_weighted["Total"]
 
     n_frames, linha_frames, coluna_frames = [], [], []
     for b in blocks:
@@ -572,8 +920,7 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
         coluna_frame.columns = cols
         coluna_frames.append(coluna_frame)
 
-        linha_frame = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
-        linha_frame = linha_frame.fillna(0.0)
+        linha_frame = linha_pct_frame(b, total_block).fillna(0.0)
         linha_frame.columns = cols
         linha_frames.append(linha_frame)
 
@@ -588,9 +935,16 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
         rows[(cat, "%COLUNA")] = coluna_table.loc[cat]
 
     base_na = na_table.sum(axis=0)
-    base_total_na = base_na[("Total", "Total")]
+    # Cada coluna é dividida pela base DO SEU bloco (mesma base do %LINHA
+    # acima): com o universo ligado, "quanto da base respondeu" fecha em
+    # 100% quando todo mundo do universo respondeu, em vez de mostrar a
+    # parcela que nem foi perguntada como se fosse falta de resposta.
+    denom = pd.Series(
+        [_base_sample_denominator(b, total_block) for b in blocks for _ in b.pct.columns],
+        index=base_na.index,
+    )
     rows[("Base Amostra", "NA")] = base_na
-    rows[("Base Amostra", "%LINHA")] = (base_na / base_total_na * 100).round(1) if base_total_na else base_na * 0.0
+    rows[("Base Amostra", "%LINHA")] = (base_na / denom.where(denom > 0) * 100).fillna(0.0).round(1)
     rows[("Base Amostra", "%COLUNA")] = pd.Series(100.0, index=base_na.index).round(1)
 
     table = pd.DataFrame(rows).T
@@ -702,7 +1056,11 @@ def table_to_excel_bytes(
     return buf.getvalue()
 
 
-def banner_table_to_excel_bytes(table: pd.DataFrame, mask: pd.DataFrame | None = None) -> bytes:
+def banner_table_to_excel_bytes(
+    table: pd.DataFrame,
+    mask: pd.DataFrame | None = None,
+    notes: list[str] | None = None,
+) -> bytes:
     """
     Serializa o banner completo (índice de 2 níveis -- categoria do stub
     + métrica NA/%LINHA/%COLUNA; coluna de 2 níveis -- bloco de banner +
@@ -716,6 +1074,10 @@ def banner_table_to_excel_bytes(table: pd.DataFrame, mask: pd.DataFrame | None =
     célula cuja base está abaixo do limiar, espelhando o destaque que já
     existe em `_highlight_small_n` na tela. Opcional: sem `mask`, exporta
     sem cor nenhuma.
+
+    `notes`: linhas de texto gravadas abaixo da tabela (ex.: a base do
+    %LINHA de cada banner, de `describe_block_base`) -- o arquivo exportado
+    circula sem a tela, então a base precisa ir junto com os números.
     """
     import io
 
@@ -774,6 +1136,12 @@ def banner_table_to_excel_bytes(table: pd.DataFrame, mask: pd.DataFrame | None =
     for cat, first_row in row_start_by_cat.items():
         ws.cell(row=first_row, column=1, value=str(cat)).font = bold
         ws.merge_cells(start_row=first_row, start_column=1, end_row=first_row + 2, end_column=1)
+
+    if notes:
+        note_row = data_start + len(table) + 1
+        ws.cell(row=note_row, column=1, value="Notas").font = bold
+        for i, text in enumerate(notes, start=1):
+            ws.cell(row=note_row + i, column=1, value=text)
 
     ws.freeze_panes = ws.cell(row=data_start, column=n_index_cols + 1).coordinate
     ws.column_dimensions["A"].width = 26

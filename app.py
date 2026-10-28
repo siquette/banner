@@ -126,6 +126,102 @@ def _build_banner_cached(
 #  GRÁFICOS
 # ══════════════════════════════════════════════════════════════════════
 
+CHART_STACKED = "Barra empilhada 100%"
+CHART_TYPES = ["Barras", "Barra horizontal", CHART_STACKED, "Linha"]
+
+# Abaixo disso o segmento é estreito demais pro rótulo caber dentro: o
+# Plotly corta ou sobrepõe o texto. O valor continua no hover.
+_STACKED_MIN_LABEL_PCT = 4.0
+
+
+def _stacked_sum_note(pct_df: pd.DataFrame, tolerance: float = 1.0) -> str | None:
+    """
+    Avisa quando as barras do empilhado NÃO somam 100%.
+
+    O gráfico se chama "100%", mas %LINHA aqui divide pela base do Total
+    do stub (não pela base de quem respondeu o banner), então a soma só
+    é 100% se todo mundo do grupo respondeu o banner E cada pessoa cai
+    em uma única coluna. Duas situações quebram isso:
+      - banner de múltipla escolha: a pessoa conta em 2+ colunas -> soma > 100%;
+      - cobertura baixa (nem todo mundo respondeu o banner) -> soma < 100%.
+    Em vez de esconder isso, o aviso diz a causa -- uma barra que
+    "deveria" fechar em 100% e não fecha parece bug de cálculo.
+    """
+    sums = pct_df.sum(axis=1)
+    if sums.empty or ((sums - 100).abs() <= tolerance).all():
+        return None
+    lo, hi = sums.min(), sums.max()
+    return (
+        f"⚠️ As barras não fecham em 100% (somam de {lo:.0f}% a {hi:.0f}%). "
+        "Acima de 100%: o banner é de múltipla escolha (a mesma pessoa conta em mais de uma cor). "
+        "Abaixo de 100%: nem todo mundo do grupo respondeu o banner (veja a cobertura acima)."
+    )
+
+
+def _build_stacked_chart(
+    pct_df: pd.DataFrame,
+    title: str,
+    value_axis_title: str,
+    legend_title: str,
+    category_label: str,
+    value_context: str,
+    bargap: float,
+) -> go.Figure:
+    """
+    Barra horizontal empilhada: uma barra por categoria do stub, um
+    segmento por categoria do banner, % escrito dentro de cada segmento.
+
+    Diferente de "Barra horizontal" (barras lado a lado, uma por série),
+    aqui as séries se somam na mesma barra -- por isso só faz sentido com
+    %LINHA, onde cada linha da tabela soma ~100%.
+
+    Decisões:
+    - `autorange="reversed"` no eixo Y: o Plotly desenha a primeira
+      categoria embaixo; aqui ela fica no topo (mesma ordem da tabela e da
+      figura de referência). "Barra horizontal" mantém o comportamento
+      antigo de propósito -- não foi pedido mexer nela.
+    - Rótulo só em segmentos >= `_STACKED_MIN_LABEL_PCT`; texto vazio nos
+      demais (o hover mostra o valor).
+    - Contorno branco fino separando os segmentos, no lugar de cantos
+      arredondados: `marker.cornerradius` só existe em versões recentes do
+      Plotly e daria erro em ambiente mais antigo.
+    - Eixo X vai até 100, ou até a maior soma se passar disso (múltipla
+      escolha) -- fixar em 100 cortaria as barras.
+    """
+    fig = go.Figure()
+    cats = pct_df.index.astype(str)
+    for col in pct_df.columns:
+        vals = pct_df[col]
+        labels = [f"{v:.0f}%" if v >= _STACKED_MIN_LABEL_PCT else "" for v in vals]
+        fig.add_trace(go.Bar(
+            name=str(col), y=cats, x=vals, orientation="h",
+            text=labels, textposition="inside", insidetextanchor="middle",
+            hovertemplate=f"{col}<br>{category_label}: %{{y}}<br>%{{x:.1f}}% {value_context}<extra></extra>",
+            marker=dict(color=category_color(str(col)), line=dict(color="white", width=1.5)),
+        ))
+
+    x_max = max(100.0, float(pct_df.sum(axis=1).max())) if len(pct_df) else 100.0
+    fig.update_layout(
+        barmode="stack",
+        bargap=bargap,
+        title=title,
+        xaxis=dict(title=value_axis_title, range=[0, x_max], ticksuffix="%"),
+        yaxis=dict(autorange="reversed"),
+        # traceorder="normal": em barra empilhada o Plotly inverte a ordem
+        # da legenda por padrão, e ela ficava "Detrator, Neutro, Promotor"
+        # -- o contrário da ordem dos segmentos. y=-0.35 (e não -0.2 como
+        # nos outros tipos) porque aqui o título do eixo X ocupa a faixa
+        # logo abaixo das barras e colava na legenda.
+        legend=dict(
+            title=legend_title, orientation="h", traceorder="normal",
+            yanchor="top", y=-0.35, xanchor="center", x=0.5,
+        ),
+        margin=dict(b=130),
+        height=max(340, 48 * len(cats) + 220),
+    )
+    return fig
+
+
 def _build_chart(
     pct_df: pd.DataFrame,
     chart_type: str,
@@ -174,6 +270,9 @@ def _build_chart(
        distintas). Categoria fora do vocabulário conhecido (a maioria das
        nominais) não recebe cor fixa, fica com a paleta padrão.
     """
+    if chart_type == CHART_STACKED:
+        return _build_stacked_chart(pct_df, title, value_axis_title, legend_title, category_label, value_context, bargap)
+
     fig = go.Figure()
     horizontal = chart_type == "Barra horizontal"
     for col in pct_df.columns:
@@ -350,19 +449,31 @@ def _render_cruzamento_tab(
     st.subheader("Gráficos")
     chart_type = st.radio(
         "Tipo de gráfico",
-        options=["Barras", "Barra horizontal", "Linha"],
+        options=CHART_TYPES,
         horizontal=True,
         help=(
             "Barra horizontal ajuda quando os nomes das categorias são longos "
             "(ex.: texto de pergunta aberta codificada) e ficam cortados no eixo "
-            "vertical. Linha só faz sentido quando as categorias do stub têm "
+            "vertical. Barra empilhada 100% coloca todas as opções do banner numa "
+            "única barra por categoria do stub, com o % escrito dentro de cada "
+            "pedaço -- existe só para %LINHA (é o que soma 100% por barra). "
+            "Linha só faz sentido quando as categorias do stub têm "
             "ordem natural (ex.: Ano, faixa etária, escala de concordância) -- "
             "pra categorias sem ordem (ex.: Gênero, Região), a linha sugere uma "
             "tendência que não existe."
         ),
     )
     bargap, bargroupgap = 0.2, 0.1
-    if chart_type in ("Barras", "Barra horizontal"):
+    stacked = chart_type == CHART_STACKED
+    if stacked:
+        # Empilhada não tem "grupo" de barras lado a lado -- só o espaço
+        # entre barras faz sentido, então o segundo slider some.
+        bargap = st.slider(
+            "Espaço entre barras", 0.0, 0.9, 0.2, 0.05,
+            help="Maior = barras mais finas, mais espaço entre categorias do eixo.",
+        )
+        st.info("Barra empilhada 100% existe só para %LINHA — o gráfico de %COLUNA não é desenhado neste tipo.")
+    elif chart_type in ("Barras", "Barra horizontal"):
         col_gap1, col_gap2 = st.columns(2)
         with col_gap1:
             bargap = st.slider(
@@ -382,6 +493,24 @@ def _render_cruzamento_tab(
         pct_linha = pct_linha.fillna(0.0)
         # %COLUNA: "quem compõe cada resposta" -- já vem pronto em b.pct.
         pct_coluna = b.pct
+
+        if stacked:
+            st.plotly_chart(
+                _build_chart(
+                    pct_linha, chart_type,
+                    title=f"{options[stub_key]} por {b.banner_label} — %LINHA",
+                    value_axis_title=f"% dentro de cada grupo de {options[stub_key]}",
+                    legend_title=b.banner_label,
+                    category_label=options[stub_key],
+                    value_context="desse grupo",
+                    bargap=bargap, bargroupgap=bargroupgap,
+                ),
+                width='stretch',
+            )
+            note = _stacked_sum_note(pct_linha)
+            if note:
+                st.caption(note)
+            continue
 
         col_linha, col_coluna = st.columns(2)
 
@@ -469,12 +598,13 @@ def _render_export_controls(
 
     csv_bytes = format_table_for_export(table).to_csv().encode("utf-8")
     xlsx_bytes = banner_table_to_excel_bytes(table, mask)
+    base_name = _crosstab_file_name(stub_key, banner_keys)
 
     with col_csv:
         st.download_button(
             "Baixar banner (CSV)",
             data=csv_bytes,
-            file_name="banner.csv",
+            file_name=f"{base_name}.csv",
             mime="text/csv",
             key=f"{key_prefix}_download_csv",
         )
@@ -482,10 +612,31 @@ def _render_export_controls(
         st.download_button(
             "Baixar banner (Excel)",
             data=xlsx_bytes,
-            file_name="banner.xlsx",
+            file_name=f"{base_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"{key_prefix}_download_xlsx",
         )
+
+
+def _crosstab_file_name(stub_key: str, banner_keys: list[str]) -> str:
+    """
+    Nome de arquivo derivado do cruzamento em si (ex.: "REGIAO_por_GENERO"),
+    em vez do "banner.csv" fixo de antes -- baixar vários cruzamentos
+    seguidos não sobrescrevia um no outro silenciosamente na pasta de
+    Downloads, mas também não dava pra saber qual era qual sem abrir cada
+    um. Usa a CHAVE técnica da variável (ex. "REGIAO"), não o rótulo
+    completo exibido na UI -- o rótulo pode ter espaço/acento/parênteses
+    que precisariam de sanitização extra pra virar nome de arquivo válido
+    em todo SO, e a chave já é um identificador limpo por natureza (é
+    assim que a variável existe no banco).
+
+    Com vários banners (ex. ["GENERO", "CLASSE"]), junta com "_e_" -- pra
+    cruzamento de 4+ banners simultâneos, o nome ficaria muito longo, mas
+    esse é um limite aceitável no PoC (não truncamos ativamente; revisar
+    se aparecer nome de arquivo estourando limite de SO na prática).
+    """
+    banner_part = "_e_".join(banner_keys) if banner_keys else "Total"
+    return f"{stub_key}_por_{banner_part}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -586,20 +737,47 @@ def _render_comparison_panel(
     )
     _save_persisted(f"{key_prefix}_banner", banner_keys)
 
+    # Dois seletores lado a lado (e não empilhados) pra não gastar mais
+    # altura do painel -- a preocupação com poluição visual é justamente
+    # o motivo de o modo Comparação mostrar só UM gráfico por vez.
+    col_side, col_type = st.columns(2)
+
     chart_options = ["%LINHA", "%COLUNA"]
-    chart_side = st.selectbox(
-        "📊 Gráfico",
-        options=chart_options,
-        index=_persisted_widget_default(f"{key_prefix}_chart_side", chart_options),
-        key=f"{key_prefix}_chart_side",
-        help=(
-            "%LINHA compara os grupos do stub entre si (leitura mais direta pra "
-            "comparação); %COLUNA mostra o perfil de quem escolheu cada opção. "
-            "A tabela abaixo sempre mostra as duas, independente dessa escolha -- "
-            "isso só decide qual vira gráfico."
-        ),
-    )
+    with col_side:
+        chart_side = st.selectbox(
+            "📊 Gráfico",
+            options=chart_options,
+            index=_persisted_widget_default(f"{key_prefix}_chart_side", chart_options),
+            key=f"{key_prefix}_chart_side",
+            help=(
+                "%LINHA compara os grupos do stub entre si (leitura mais direta pra "
+                "comparação); %COLUNA mostra o perfil de quem escolheu cada opção. "
+                "A tabela abaixo sempre mostra as duas, independente dessa escolha -- "
+                "isso só decide qual vira gráfico."
+            ),
+        )
     _save_persisted(f"{key_prefix}_chart_side", chart_side)
+
+    # Mesmas três opções da aba Cruzamento (`_render_cruzamento_tab`), pra
+    # as duas abas oferecerem o mesmo repertório. "Barra horizontal" é o
+    # equivalente em Plotly (`go.Bar(orientation="h")`) do `Axes.barh` do
+    # matplotlib -- mesma figura, mas mantém hover e zoom e não exige uma
+    # segunda biblioteca de gráfico. Antes, esta aba tinha "Barras" fixo.
+    chart_type_options = CHART_TYPES
+    with col_type:
+        chart_type = st.selectbox(
+            "Tipo",
+            options=chart_type_options,
+            index=_persisted_widget_default(f"{key_prefix}_chart_type", chart_type_options),
+            key=f"{key_prefix}_chart_type",
+            help=(
+                "Barra horizontal ajuda quando os nomes das categorias são longos "
+                "e ficam cortados no eixo vertical. Linha só faz sentido quando as "
+                "categorias do stub têm ordem natural (ex.: Ano, faixa etária). "
+                "Barra empilhada 100% só funciona com %LINHA."
+            ),
+        )
+    _save_persisted(f"{key_prefix}_chart_type", chart_type)
 
     if not banner_keys:
         st.info("Selecione ao menos uma variável de banner pra este painel.")
@@ -644,7 +822,12 @@ def _render_comparison_panel(
     st.dataframe(styled, width='stretch', height=320)
 
     row_totals_weighted = blocks[0].cell_weighted["Total"]
-    for b in blocks[1:]:
+    stacked_needs_linha = chart_type == CHART_STACKED and chart_side != "%LINHA"
+    if stacked_needs_linha:
+        # Em vez de cair em silêncio pra outro tipo (o analista acharia que
+        # está vendo empilhado), explica e diz o que fazer.
+        st.info("Barra empilhada 100% só existe para %LINHA — troque o seletor 📊 Gráfico para %LINHA.")
+    for b in ([] if stacked_needs_linha else blocks[1:]):
         if chart_side == "%LINHA":
             pct_df = b.cell_weighted.divide(row_totals_weighted, axis=0) * 100
             pct_df = pct_df.fillna(0.0)
@@ -656,7 +839,7 @@ def _render_comparison_panel(
             value_context = "de quem respondeu isso"
 
         fig = _build_chart(
-            pct_df, "Barras",
+            pct_df, chart_type,
             title=f"{options[stub_key]} por {b.banner_label} — {chart_side}",
             value_axis_title=value_axis_title,
             legend_title=b.banner_label,
@@ -665,6 +848,10 @@ def _render_comparison_panel(
             bargap=bargap, bargroupgap=bargroupgap,
         )
         st.plotly_chart(fig, width='stretch', key=f"{key_prefix}_chart_{b.banner_key}")
+        if chart_type == CHART_STACKED:
+            note = _stacked_sum_note(pct_df)
+            if note:
+                st.caption(note)
 
     _render_export_controls(table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix=key_prefix)
 

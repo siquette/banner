@@ -60,6 +60,7 @@ class VarType(str, Enum):
     INDICATOR = "indicator"         # indicador pré-categorizado, com N/A textual possível
     IDENTIFIER = "identifier"       # ID -- não deve entrar como variável cruzável de conteúdo
     WEIGHT = "weight"                # coluna de peso amostral
+    EXCLUDED = "excluded"           # coluna que existe no banco mas foi retirada do app de propósito
 
 
 @dataclass
@@ -84,8 +85,17 @@ class VariableMeta:
 # Nomes de colunas que identificam o respondente ou carregam peso amostral
 # -- nunca devem aparecer como opção de cruzamento de conteúdo no filtro da
 # UI. Ajustar aqui se um banco novo usar nomes diferentes pra ID/peso.
-_IDENTIFIER_NAMES = {"ID"}
+# "ID_UNICO" (banco 2026) tem uma categoria por linha -- como SR, entrava no
+# seletor de cruzamento com ~119 mil categorias e travava a tela.
+_IDENTIFIER_NAMES = {"ID", "ID_UNICO"}
 _WEIGHT_NAMES = {"PESO", "WEIGHT", "PESO_AMOSTRAL"}
+
+# Colunas que existem no banco mas não devem aparecer em nenhum lugar do
+# app (decisão do Ro, 16/11/2026): IMCE e IMCT (N26_033 / N26_035) -- índices
+# de confiança em coleta/tratamento de esgoto, que não serão usados. Lista
+# explícita (e não regra por padrão) porque é decisão de negócio, não
+# propriedade do dado: se voltarem a ser usados, basta tirar daqui.
+_EXCLUDED_NAMES = {"N26_033", "N26_035"}
 
 # "código-opção": code = tudo antes do primeiro "-", option = o resto.
 # Não-guloso (.+?) pra parar no PRIMEIRO "-", já que o texto da opção
@@ -254,11 +264,24 @@ def classify_columns(
         if m:
             code_counts[m.group("code")] = code_counts.get(m.group("code"), 0) + 1
 
+    # Bases que têm companion "_media" no banco -- usado pra decidir se uma
+    # coluna com rótulo "..._c" é de fato um índice (ver o bloco INDICATOR
+    # abaixo). Calculado numa passada própria porque a coluna "_media" pode
+    # vir DEPOIS da "_c" na ordem do banco.
+    media_bases = {
+        mm.group("base")
+        for mm in (_MEDIA_PATTERN.match(n) for n in short_names)
+        if mm is not None
+    }
+
     meta: dict[str, VariableMeta] = {}
 
     for name in short_names:
         label = label_by_name[name]
 
+        if name in _EXCLUDED_NAMES:
+            meta[name] = VariableMeta(name, label, VarType.EXCLUDED)
+            continue
         if name in _IDENTIFIER_NAMES:
             meta[name] = VariableMeta(name, label, VarType.IDENTIFIER)
             continue
@@ -302,7 +325,13 @@ def classify_columns(
             )
             continue
 
-        if _INDICATOR_LABEL_PATTERN.search(label.strip()):
+        # Índice de verdade = rótulo "_c" E companion "<nome>_media" no banco
+        # (é assim que `indices.indicator_media_map` pareia). Só o sufixo "_c"
+        # não basta: no banco 2026, "N26_004. CLASSE_c" (A/B1/B2/C1/C2/DE) tem
+        # o mesmo sufixo mas é demografia -- sem a checagem ela cairia na aba
+        # Índices tentando virar média de 1 a 5. Sem companion, vira SR
+        # (continua cruzável como qualquer categórica).
+        if _INDICATOR_LABEL_PATTERN.search(label.strip()) and name in media_bases:
             col = data[name]
             if isinstance(col, pd.DataFrame):  # nome duplicado não desambiguado antes de chegar aqui
                 col = col.iloc[:, 0]
@@ -374,7 +403,7 @@ def crossable_variables(meta: dict[str, VariableMeta]) -> list[dict]:
     seen_mr: set[str] = set()
 
     for m in meta.values():
-        if m.var_type in (VarType.IDENTIFIER, VarType.WEIGHT, VarType.SCALE_MEDIA):
+        if m.var_type in (VarType.IDENTIFIER, VarType.WEIGHT, VarType.SCALE_MEDIA, VarType.EXCLUDED):
             continue
         if m.var_type == VarType.MR_OPTION:
             if m.mr_group in seen_mr:

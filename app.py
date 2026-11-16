@@ -66,7 +66,7 @@ st.set_page_config(page_title="Gerador de Banner", layout="wide")
 # raiz do repositório clonado. BANNER_DATA_PATH sobrescreve isso via
 # variável de ambiente, só pra testar outro arquivo localmente sem editar
 # código -- nunca é setada em produção.
-DATA_PATH = Path(os.environ.get("BANNER_DATA_PATH", str(Path(__file__).parent / "df_completo_v2_corrigido.parquet")))
+DATA_PATH = Path(os.environ.get("BANNER_DATA_PATH", str(Path(__file__).parent / "df_completo_2026.parquet")))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -422,7 +422,53 @@ def _build_chart(
 #  ABA: CRUZAMENTO
 # ══════════════════════════════════════════════════════════════════════
 
-def _render_block_notes(blocks: list) -> None:
+@st.cache_data(show_spinner=False)
+def _question_years_cached(_data: pd.DataFrame, _meta: dict, stub_key: str, data_signature: tuple) -> tuple:
+    """
+    Anos (coluna ANO) em que a pergunta `stub_key` tem ao menos uma
+    resposta, no banco INTEIRO (sem filtro). `data_signature` (shape do
+    banco) é quem invalida o cache -- `_data`/`_meta` têm underscore pra o
+    Streamlit não hashear o DataFrame de 119 mil linhas a cada chamada.
+
+    POR QUE EXISTE: no banco 2026 há perguntas feitas só em 2026 (138) e
+    perguntas que existiam e não foram feitas em 2026 (223). A base do
+    %LINHA já está certa nesses casos (regra de universo), mas nada na
+    tela dizia ao usuário que a pergunta só existe em alguns anos -- quem
+    lê "Total" tende a achar que é o banco todo.
+
+    Devolve () se o banco não tem coluna ANO.
+    """
+    if "ANO" not in _data.columns:
+        return ()
+    members = [m.name for m in _meta.values() if m.var_type == VarType.MR_OPTION and m.mr_group == stub_key]
+    cols = members if members else [stub_key]
+    # MR: opção marcada = True (bool); SR/indicador: qualquer valor não nulo.
+    # `notna()` serve pros dois porque, no parquet, MR não marcada é False
+    # em coluna bool -- por isso MR precisa de `.any()` sobre o valor, não sobre notna.
+    if members:
+        answered = _data[cols].fillna(False).astype(bool).any(axis=1)
+    else:
+        answered = _data[cols[0]].notna()
+    years = answered.groupby(_data["ANO"].astype(str), observed=True).any()
+    return tuple(sorted(y for y, ok in years.items() if ok))
+
+
+def _availability_note(data: pd.DataFrame, meta: dict, stub_key: str) -> str | None:
+    """
+    Frase "pergunta feita só em X" quando a pergunta não cobre todos os
+    anos do banco; None quando cobre todos (nada a avisar).
+    """
+    all_years = tuple(sorted(data["ANO"].astype(str).unique())) if "ANO" in data.columns else ()
+    if not all_years:
+        return None
+    years = _question_years_cached(data, meta, stub_key, tuple(data.shape))
+    if not years or len(years) == len(all_years):
+        return None
+    missing = [y for y in all_years if y not in years]
+    return f"Pergunta aplicada apenas em {', '.join(years)} (não feita em {', '.join(missing)})."
+
+
+def _render_block_notes(blocks: list, availability: str | None = None) -> None:
     """
     Legenda de base + avisos por variável de banner, acima da tabela --
     compartilhada pela aba Cruzamento e pelos painéis do Comparar (antes
@@ -435,6 +481,8 @@ def _render_block_notes(blocks: list) -> None:
     errada "as barras deveriam fechar 100% do ano inteiro": o ano inteiro
     inclui gente a quem a pergunta nunca foi feita.
     """
+    if availability:
+        st.caption(f"📅 {availability}")
     for b in blocks[1:]:
         own_n = int(b.base_n.sum())
         base = b.base_people
@@ -447,9 +495,10 @@ def _render_block_notes(blocks: list) -> None:
             st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
 
 
-def _export_notes(blocks: list, use_weighting: bool) -> list[str]:
-    """Linhas de nota que vão junto do CSV/Excel -- a base de cada %LINHA e a convenção de peso."""
-    notes = [f"{b.banner_label}: {describe_block_base(b)}" for b in blocks[1:]]
+def _export_notes(blocks: list, use_weighting: bool, availability: str | None = None) -> list[str]:
+    """Linhas de nota que vão junto do CSV/Excel -- a base de cada %LINHA, a convenção de peso e, se houver, os anos em que a pergunta foi aplicada."""
+    notes = [availability] if availability else []
+    notes += [f"{b.banner_label}: {describe_block_base(b)}" for b in blocks[1:]]
     notes.append("Peso amostral aplicado aos percentuais." if use_weighting else "Percentuais sem peso amostral (contagem bruta).")
     return notes
 
@@ -518,7 +567,7 @@ def _render_cruzamento_tab(
         mask = pd.concat([unfiltered_mask, mask], axis=1)
 
     # --- legendas de cobertura por variável de banner ---
-    _render_block_notes(blocks)
+    _render_block_notes(blocks, _availability_note(data, meta, stub_key))
 
     st.subheader(f"{options[stub_key]}")
     if use_weighting:
@@ -680,7 +729,7 @@ def _render_cruzamento_tab(
 
     _render_export_controls(
         table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix="cruzamento",
-        notes=_export_notes(blocks, use_weighting), extra_signature=(use_weighting, use_universe),
+        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key)), extra_signature=(use_weighting, use_universe),
     )
 
 
@@ -961,7 +1010,7 @@ def _render_comparison_panel(
     table = format_banner_table_full(blocks)
     mask = small_n_mask_full(blocks)
 
-    _render_block_notes(blocks)
+    _render_block_notes(blocks, _availability_note(data, meta, stub_key))
 
     def _highlight_small_n(_: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=table.index, columns=table.columns)
@@ -1020,7 +1069,7 @@ def _render_comparison_panel(
 
     _render_export_controls(
         table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix=key_prefix,
-        notes=_export_notes(blocks, use_weighting), extra_signature=(use_weighting, use_universe),
+        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key)), extra_signature=(use_weighting, use_universe),
     )
 
 

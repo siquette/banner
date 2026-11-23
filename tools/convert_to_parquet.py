@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # _MEDIA_PATTERN e _WEIGHT_NAMES são "privados" de metadata.py (prefixo
 # _), mas importados aqui de propósito -- são os MESMOS padrões que
 # classify_columns usa pra reconhecer coluna de peso e companion numérico.

@@ -33,7 +33,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from metadata import (
     VarType,
     _RM_TAG_PATTERN,
@@ -177,7 +177,7 @@ def audit(path: str, sheet_name: str = "Dados") -> None:
     ):
         print("\n".join(check) + "\n")
 
-    out_path = path_obj.with_name("variaveis_cruzamento.csv")
+    out_path = Path(__file__).resolve().parent.parent / "docs" / "variaveis_cruzamento.csv"
     _write_csv(out_path, entries, groups)
     print(f"Lista completa salva em: {out_path}\n")
 

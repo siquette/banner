@@ -5,3 +5,6 @@
 
 __pycache__/
 *.pyc
+
+arquivo_antigo/
+__pycache__/

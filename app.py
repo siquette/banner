@@ -66,7 +66,10 @@ st.set_page_config(page_title="Gerador de Banner", layout="wide")
 # raiz do repositório clonado. BANNER_DATA_PATH sobrescreve isso via
 # variável de ambiente, só pra testar outro arquivo localmente sem editar
 # código -- nunca é setada em produção.
-DATA_PATH = Path(os.environ.get("BANNER_DATA_PATH", str(Path(__file__).parent / "df_completo_2026.parquet")))
+DATA_PATH = Path(os.environ.get(
+    "BANNER_DATA_PATH",
+    str(Path(__file__).parent / "data" / "processed" / "df_completo_2026.parquet"),
+))
 
 
 # ══════════════════════════════════════════════════════════════════════

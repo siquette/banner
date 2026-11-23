@@ -1758,7 +1758,7 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
         st.header("3. Regras")
         use_weighting = st.toggle(
             "Aplicar peso amostral (PESO)",
-            value=False,
+            value=True,
             help=(
                 "Desligado por padrão: %LINHA/%COLUNA usam contagem bruta (NA), sem "
                 "peso amostral -- é o padrão de referência usado hoje. O peso amostral "
@@ -1823,7 +1823,7 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
 # ══════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    st.title("Gerador de tabela banner")
+    st.title("Cruza-Tudo")
     st.caption(
         "Cruza qualquer variável de conteúdo (stub) contra qualquer variável de perfil (banner), "
         "com múltipla resposta tratada automaticamente — sem pivotar nada manualmente antes."
@@ -1848,6 +1848,12 @@ def main() -> None:
         filtered_data, stub_key, banner_keys, na_handling, small_n_threshold,
         active_filters, use_weighting, use_universe, visible_options,
     ) = _render_sidebar(data, meta, options)
+
+    # Aviso de peso: logo abaixo do cabeçalho, vale para todas as abas.
+    if use_weighting:
+        st.info("⚖️ **Peso amostral LIGADO** — percentuais ponderados pelo PESO (NA segue contagem bruta).")
+    else:
+        st.warning("⚖️ **Peso amostral DESLIGADO** — Cruzamento e Comparar em contagem bruta, sem ponderar. A aba Índices é sempre ponderada. Pra ponderar, ligue em \"3. Regras\" na barra lateral.")
 
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")

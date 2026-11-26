@@ -18,6 +18,7 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 - [Como rodar localmente](#como-rodar-localmente)
 - [Como atualizar o banco](#como-atualizar-o-banco)
 - [Como fazer deploy](#como-fazer-deploy)
+- [Estatística](#estatística)
 - [Filtro SQL](#filtro-sql)
 - [Arquitetura](#arquitetura)
 - [Convenções de dado descobertas](#convenções-de-dado-descobertas)
@@ -32,7 +33,8 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 ```
 app.py, metadata.py,        código do app -- fica na raiz porque o Streamlit
 crosstab_engine.py,         Cloud exige `app.py` na raiz (Main file path) e
-indices.py, sql_filter.py   os módulos se importam entre si pelo nome
+indices.py, sql_filter.py,  os módulos se importam entre si pelo nome
+stats_engine.py
 requirements.txt            o que o Streamlit Cloud lê pra montar o ambiente
 pixi.toml / pixi.lock       ambiente local
 data/
@@ -43,6 +45,7 @@ tools/                      scripts offline, rodados à mão (nunca pelo app)
   list_variables.py           audita a classificação de variáveis
   make_sample.py              gera a amostra de data/sample
 docs/                       documentação e relatórios gerados
+tests/                      testes automáticos (pytest) -- `pixi run test`
 ```
 
 Arquivos `.xlsx` brutos **não ficam no repositório** (`.gitignore`): são
@@ -58,6 +61,9 @@ banco](#como-atualizar-o-banco)) em `data/processed/`.
 pixi install
 pixi run streamlit run app.py
 ```
+
+Testes automáticos: `pixi run test` (ou `python -m pytest tests`, com
+`pip install pytest`). Rodar antes de subir mudança em conta estatística.
 
 **Windows:** o `pixi.toml` declara só `platforms = ["linux-64"]`. Pra
 usar pixi no Windows, adicione `"win-64"` a essa lista; ou use um
@@ -151,6 +157,61 @@ de coluna antes de escrever o parquet (ver `_optimize_memory` no
 código) -- sem isso, o banco de produção projetava ~1,3GB só pra existir
 carregado, estourando o limite antes de qualquer conta rodar.
 
+## Estatística
+
+Aba **📐 Estatística**, parte **Descritivas** (os testes de hipótese são a
+próxima fase). Serve pras variáveis **numéricas** do banco -- as colunas
+`_media` (índices, notas, idade, nº de moradores...). O Cruzamento e o
+Comparar continuam sendo o lugar das categóricas (frequência e %).
+
+**Como usar**
+
+1. Escolha uma ou mais variáveis numéricas (busca pelo código ou pelo texto
+   da pergunta).
+2. Se quiser, **quebre por** uma categórica (ANO, UF, OPERACAO...): a tabela
+   ganha uma linha por grupo e o gráfico compara os grupos.
+3. Marque os **cálculos** e escolha o **gráfico**.
+
+**Escala ou contínua.** O app separa sozinho: até 11 valores diferentes é
+**escala** (nota de 1 a 5, de 0 a 10); o resto é **contínua** (idade,
+média de vários itens, valores). Isso decide o gráfico recomendado:
+
+| Tipo | Recomendado | Por quê |
+|---|---|---|
+| escala | barras com o % de cada nota | numa escala de 1 a 5 a caixa do box plot quase sempre vai de 3 a 4 e esconde a diferença (dos 15 índices, 10 têm a caixa igual, com médias de 3,27 a 4,21) |
+| contínua, sem quebra | histograma | mostra o formato da distribuição |
+| contínua, com quebra | box plot | compara os grupos lado a lado |
+
+Os outros gráficos continuam disponíveis; quando a escolha não serve pro
+tipo, o app avisa e explica. A **dispersão** compara as duas primeiras
+variáveis escolhidas, com uma amostra de 5.000 pontos (com 100 mil vira
+uma mancha); variável de escala é tremida um pouco pra os pontos não
+caírem todos no mesmo lugar.
+
+**Os cálculos** (fórmulas e porquês em `stats_engine.py`):
+
+- Tudo **ponderado pelo PESO** quando o peso está ligado na barra lateral;
+  com o peso desligado, viram as fórmulas de sempre.
+- **n** = entrevistas com valor; **n efetivo** = quanto a amostra "vale"
+  depois do peso (no banco de 2026 inteiro, ~49% do n).
+- **Erro padrão** considera o peso; **IC 95%** = média ± t × erro padrão,
+  com n efetivo − 1 graus de liberdade.
+- **Mediana e quartis** são sempre um valor que existe no dado (numa escala
+  de 1 a 5, a mediana é 3 ou 4, nunca 3,5).
+- **Amostra por cota:** erro padrão e IC são a convenção de mercado (como se
+  a amostra fosse sorteada). Servem pra comparar a incerteza entre grupos,
+  não como probabilidade de erro de verdade.
+
+Grupo sem nenhuma resposta (ex.: ano em que a pergunta não foi feita) sai
+da tabela, com aviso. Respeita o filtro SQL e os da barra lateral.
+
+**Índice de multiplicidade** (no Cruzamento): quando a variável de linha é
+de múltipla escolha, aparece embaixo do banner a média de opções marcadas
+por respondente, por coluna, e ela vai pras Notas da exportação. É a soma
+do %COLUNA ÷ 100, então bate com a tabela. A base é quem marcou pelo menos
+uma opção (o banco não separa quem pulou a pergunta), por isso o índice
+nunca fica abaixo de 1.
+
 ## Filtro SQL
 
 Aba **🔎 Filtro SQL** (a última). Serve pra recorte que a barra lateral não
@@ -197,7 +258,7 @@ AND OPERACAO = 'PLENA'
   filtros da barra lateral vêm depois, em cascata, já só com os valores
   que sobraram. (Se o SQL rodasse depois, uma subconsulta como "presente
   em todos os anos" daria errado com ANO filtrado na barra lateral.)
-- Vale pras cinco abas. A coluna "Total geral (sem filtro)" do banner
+- Vale pra todas as abas. A coluna "Total geral (sem filtro)" do banner
   aparece quando há filtro SQL.
 - Enquanto houver filtro SQL, um **aviso fixo** fica no topo de todas as
   abas e na barra lateral, com a condição e o número de entrevistas.
@@ -231,6 +292,7 @@ metadata.py            classifica cada coluna (SR/MR/indicador/peso/...)
         ├──> crosstab_engine.py     motor de cruzamento ponderado
         ├──> indices.py             tendência/quadrante dos índices
 sql_filter.py          filtro SQL (DuckDB): condição -> máscara de linhas
+stats_engine.py        estatística descritiva ponderada (aba Estatística)
         │
 tools/convert_to_parquet.py   script offline: xlsx -> parquet otimizado
 tools/list_variables.py       script offline: audita a classificação
@@ -245,7 +307,8 @@ app.py                  interface Streamlit (só orquestra, não calcula)
 | `crosstab_engine.py` | Motor de cruzamento ponderado. Normaliza qualquer variável (SR ou MR) pro mesmo formato longo (`resp_id \| category \| weight`) antes de cruzar -- é isso que elimina a necessidade de pivotar múltipla resposta manualmente. Calcula NA, %LINHA, %COLUNA, e os avisos de cobertura. |
 | `indices.py` | Média ponderada, tendência entre ondas e correlação ponderada entre índices (pro quadrante). Separado do motor de cruzamento porque índice não tem categoria pra cruzar, tem um número. |
 | `sql_filter.py` | Filtro SQL da aba Filtro SQL: confere a condição, roda no DuckDB com as travas de segurança e devolve quais entrevistas passaram; traduz o erro pro português. Não conhece o Streamlit. |
-| `app.py` | Interface Streamlit -- cinco abas (Cruzamento / Comparar / Índices / Diagnóstico de dados / Filtro SQL). Banco fixo: lê sempre o `.parquet` de caminho relativo ao próprio arquivo, sem upload nem input de caminho na tela. |
+| `stats_engine.py` | Estatística descritiva ponderada das numéricas (média, erro padrão, IC, quantis, moda...) e os números dos gráficos (distribuição, histograma, box plot). Não conhece o Streamlit; testado em `tests/`. |
+| `app.py` | Interface Streamlit -- seis abas (Cruzamento / Comparar / Índices / Estatística / Filtro SQL / Diagnóstico de dados). Banco fixo: lê sempre o `.parquet` de caminho relativo ao próprio arquivo, sem upload nem input de caminho na tela. |
 | `tools/convert_to_parquet.py` | Script que roda fora do Streamlit, converte o `.xlsx` bruto pra `.parquet` otimizado. Único jeito de atualizar o banco. |
 | `tools/list_variables.py` | Audita a classificação de variáveis, gera `docs/variaveis_cruzamento.csv` pra revisão manual. |
 | `tools/make_sample.py` | Gera a amostra de `data/sample/`, estratificada por onda. |
@@ -341,9 +404,9 @@ Padrões que não são óbvios e custaram investigação contra o banco real
 ## Backlog (fases futuras)
 
 - Box plot das variáveis que compõem um índice.
-- Testes automatizados, começando pelas perguntas de múltipla resposta
-  (`crosstab_engine.py` e `metadata.py`); criar `tests/` com o primeiro
-  teste.
+- Mais testes automatizados: `tests/` já cobre `stats_engine.py` e o índice
+  de multiplicidade; falta o resto do `crosstab_engine.py` e o `metadata.py`
+  (começando pelas perguntas de múltipla resposta).
 - Clusterizar assuntos/variáveis e visualizar força de ligação com
   grafos -- usar correlação (Pearson pra contínua, Spearman pra ordinal,
   V de Cramér pra categórica sem ordem), considerar Análise Fatorial

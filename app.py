@@ -27,11 +27,13 @@ ESTRUTURA DESTE ARQUIVO
 3. Aba Cruzamento -- `_render_cruzamento_tab`
 4. Aba Índices -- três visões (`_render_indices_overview/_individual/
    _quadrant`) chamadas por `_render_indices_tab`
-5. Aba Filtro SQL -- `_render_sql_tab`, e o filtro SQL em si
+5. Aba Estatística -- `_render_estatistica_tab` (descritivas das
+   numéricas; a conta mora em `stats_engine.py`)
+6. Aba Filtro SQL -- `_render_sql_tab`, e o filtro SQL em si
    (`_filtro_sql_atual`, aviso fixo `_render_aviso_sql`); a conta mora em
    `sql_filter.py`
-6. Barra lateral -- `_render_sidebar`, devolve os valores escolhidos
-7. `main()` -- amarra tudo
+7. Barra lateral -- `_render_sidebar`, devolve os valores escolhidos
+8. `main()` -- amarra tudo
 
 Rodar localmente:
     pixi run streamlit run app.py
@@ -42,9 +44,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+import stats_engine as se
 
 from crosstab_engine import (
     banner_table_to_excel_bytes,
@@ -55,6 +60,7 @@ from crosstab_engine import (
     get_column_series,
     get_weights,
     linha_pct_frame,
+    mentions_per_respondent,
     small_n_mask_full,
     table_to_excel_bytes,
     variables_with_data,
@@ -583,6 +589,7 @@ def _render_cruzamento_tab(
     table = format_banner_table_full(blocks)
     mask = small_n_mask_full(blocks)
 
+    unfiltered_blocks = None
     if active_filters:
         # Total sem filtro nenhum -- só pra comparação lado a lado com o
         # Total já filtrado que o resto da tabela usa. banner_keys=[] faz
@@ -672,6 +679,7 @@ def _render_cruzamento_tab(
         "%COLUNA = % dentro da categoria do banner. Células em amarelo: base "
         "abaixo do limiar definido — leia o percentual com cautela."
     )
+    linha_multiplicidade = _render_multiplicidade(meta, stub_key, blocks, unfiltered_blocks, table.columns)
 
     # --- gráficos: %LINHA e %COLUNA lado a lado, por variável de banner ---
     st.subheader("Gráficos")
@@ -772,9 +780,46 @@ def _render_cruzamento_tab(
 
     _render_export_controls(
         table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix="cruzamento",
-        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key), _filter_note_lines(active_filters, meta)),
+        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key), _filter_note_lines(active_filters, meta))
+        + ([linha_multiplicidade] if linha_multiplicidade else []),
         extra_signature=(use_weighting, use_universe),
     )
+
+
+def _render_multiplicidade(meta: dict, stub_key: str, blocks: list, unfiltered_blocks: list | None, colunas) -> str | None:
+    """
+    Índice de multiplicidade (média de opções marcadas por respondente)
+    embaixo do banner, quando o stub é de MÚLTIPLA ESCOLHA -- uma linha,
+    alinhada às colunas da tabela. Devolve a mesma informação como uma
+    linha de texto pras Notas da exportação (ou None se o stub não é MR).
+    A conta é `mentions_per_respondent`: soma do %COLUNA ÷ 100, então
+    bate com a tabela por construção.
+    """
+    if not _is_mr_key(meta, stub_key):
+        return None
+    valores = mentions_per_respondent(blocks)
+    if unfiltered_blocks is not None:
+        sem_filtro = mentions_per_respondent(unfiltered_blocks)
+        sem_filtro.index = pd.MultiIndex.from_tuples([("Total geral (sem filtro)", c[1]) for c in sem_filtro.index])
+        valores = pd.concat([sem_filtro, valores])
+    valores.index = pd.MultiIndex.from_tuples(list(valores.index))
+    # mesmas colunas da tabela do banner (que só tem uma coluna por categoria, não as 3 linhas NA/%)
+    linha = valores.reindex(pd.MultiIndex.from_tuples(list(colunas)))
+    st.markdown("**Índice de multiplicidade** — média de opções marcadas por respondente")
+    st.dataframe(
+        linha.to_frame("Média de menções por respondente").T.style.format("{:.2f}", na_rep="—"),
+        width="stretch", placeholder="—",
+    )
+    st.caption(
+        "Entre quem respondeu a pergunta (marcou pelo menos uma opção): total de opções marcadas ÷ pessoas. "
+        "É a soma do %COLUNA ÷ 100. O banco não separa quem pulou a pergunta de quem não marcou nada, "
+        "por isso o índice nunca fica abaixo de 1."
+    )
+    partes = [
+        f"{c[1] if c[0] == c[1] else f'{c[0]} {c[1]}'} " + f"{v:.2f}".replace(".", ",")
+        for c, v in linha.items() if pd.notna(v)
+    ]
+    return "Média de menções por respondente (índice de multiplicidade): " + " · ".join(partes)
 
 
 def _render_export_controls(
@@ -1521,66 +1566,6 @@ def _binned_media_counts(series: pd.Series) -> pd.Series:
     return counts
 
 
-_DEMOGRAFIA_MEDIA: dict[str, str] = {
-    "F1_media": "Idade",
-    "P50_media": "Nº de moradores",
-    "P50.1_media": "Nº de crianças",
-}
-# Companions `_media` que são demografia, não índice de satisfação --
-# mesmo padrão de nome (`_media`, dtype numérico) dos 15 índices, mas em
-# escala completamente diferente (idade vai de ~18 a ~90, não de 1 a 5).
-# Descobertos vasculhando as 128 colunas `_media` do banco -- só 15
-# viram índice oficial, o resto são sub-itens ou perguntas soltas como
-# essas 3. Ficam fora de `indicator_media_map`/`_binned_media_counts` de
-# propósito (o binning de 1 a 5 não faz sentido pra idade), e entram
-# aqui como lista separada, com rótulo pra exibição em vez do nome cru.
-
-
-def _render_boxplot_secao(base: pd.DataFrame, meta: dict) -> None:
-    """
-    Boxplot dos 15 índices (mesma escala 1-5, todos no mesmo eixo, pra
-    comparar direto) + 3 variáveis demográficas (escalas diferentes
-    entre si -- cada uma no seu próprio gráfico).
-
-    Bruto, não ponderado -- mesma filosofia do resto da aba: aqui o
-    objetivo é ver o dado como ele é, não a estimativa populacional.
-
-    `boxmean=True` desenha a média como linha tracejada dentro da
-    caixa, ao lado da mediana que o boxplot já desenha sozinho -- a
-    distância entre as duas é o sinal de que a média está sendo puxada
-    por uma cauda (assimetria), sem precisar ler número nenhum.
-
-    Eixo Y dos índices NÃO é travado em [1, 5] de propósito: se algum
-    valor tiver escapado da escala -- o tipo de bug que já apareceu no
-    ISDE -- ele precisa ficar visível no gráfico, não cortado fora.
-    """
-    st.markdown("### Boxplot — índices e demografia")
-
-    st.markdown("**Índices** (escala 1-5, todos no mesmo eixo pra comparar)")
-    media_map = indicator_media_map(meta)
-    fig = go.Figure()
-    for ind, media_col in sorted(media_map.items()):
-        if media_col not in base.columns:
-            continue
-        values = pd.to_numeric(base[media_col], errors="coerce").dropna()
-        fig.add_trace(go.Box(y=values, name=ind, boxmean=True))
-    fig.update_layout(showlegend=False, yaxis_title="Nota (1-5)", height=450)
-    st.plotly_chart(fig, width='stretch')
-
-    st.markdown("**Demografia** (escalas diferentes entre si -- um gráfico por variável)")
-    cols = st.columns(len(_DEMOGRAFIA_MEDIA))
-    for col_widget, (col_name, label) in zip(cols, _DEMOGRAFIA_MEDIA.items()):
-        with col_widget:
-            if col_name not in base.columns:
-                st.caption(f"{col_name} não existe nesse banco.")
-                continue
-            values = pd.to_numeric(base[col_name], errors="coerce").dropna()
-            fig_d = go.Figure()
-            fig_d.add_trace(go.Box(y=values, name=label, boxmean=True))
-            fig_d.update_layout(showlegend=False, height=400, title=label)
-            st.plotly_chart(fig_d, width='stretch')
-
-
 def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame) -> None:
     """
     Aba de DIAGNÓSTICO de dados brutos -- não é visualização, é "como
@@ -1650,7 +1635,6 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
     st.markdown("**describe()**")
     st.dataframe(subset.describe(include="all").T, width='stretch')
 
-    _render_boxplot_secao(base, meta)
 
     with st.expander("Ver linhas cruas (opcional)"):
         n_linhas = st.number_input(
@@ -1659,6 +1643,358 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
             help="Limitado de propósito -- mostrar as 100k+ linhas de uma vez pode estourar a memória do app.",
         )
         st.dataframe(subset.head(int(n_linhas)), width='stretch')
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ESTATÍSTICA (aba 📐 Estatística — parte Descritivas)
+# ══════════════════════════════════════════════════════════════════════
+# A conta mora em `stats_engine.py` (ponderada, testada em `tests/`); aqui
+# fica a escolha do usuário e o desenho. Decisões do Ro (25/11): uma ou
+# mais numéricas, quebra opcional por uma categórica, o usuário marca os
+# cálculos e escolhe o gráfico -- e o app recomenda o gráfico certo pelo
+# tipo da variável e explica quando a escolha não serve, porque quem usa
+# nem sempre sabe qual estatística cabe em qual variável.
+
+GRAFICO_RECOMENDADO = "Recomendado"
+GRAFICO_BARRAS = "Barras de distribuição"
+GRAFICO_HIST = "Histograma"
+GRAFICO_BOX = "Box plot"
+GRAFICO_DISPERSAO = "Dispersão"
+_GRAFICOS_EST = [GRAFICO_RECOMENDADO, GRAFICO_BARRAS, GRAFICO_HIST, GRAFICO_BOX, GRAFICO_DISPERSAO]
+_SEM_QUEBRA = "(sem quebra)"
+_MAX_GRUPOS_GRAFICO = 12   # acima disso o gráfico vira ilegível; a tabela mostra todos
+_MAX_GRUPOS_HIST = 6       # histograma por grupo = um painel por grupo
+_PONTOS_DISPERSAO = 5000
+
+# Paleta validada (skill dataviz, `references/palette.md`): categórica em
+# ordem fixa e rampa azul sequencial, com versão própria pro tema escuro.
+_PALETA_EST = {
+    "light": {
+        "serie": ["#257de0", "#f47230", "#00b894", "#f2a600", "#ee7fac", "#008a17", "#6a4ce2", "#ec4647"],
+        # rampa azul, passos 250 a 650 de 100 em 100: degraus iguais, pra nota 4 não se confundir com a 5
+        # (mais claro que 250 some no fundo branco)
+        "rampa": ["#84b9f3", "#519ced", "#257de0", "#1b64be", "#0f4a96"],
+        "claras": 2,  # quantas cores do começo da rampa pedem texto escuro em cima
+        "vao": "#ffffff",
+    },
+    "dark": {
+        "serie": ["#338ced", "#e76624", "#00a888", "#d28e05", "#e24d8b", "#0aac23", "#9887ef", "#eb6263"],
+        # no escuro a rampa inverte: valor maior = mais claro (mais contraste com o fundo); nada mais escuro que o passo 600
+        "rampa": ["#1757ac", "#2370cd", "#338ced", "#6aabf1", "#9dc8f7"],
+        "claras": -2,  # as 2 ÚLTIMAS cores são claras e pedem texto escuro
+        "vao": "#0e1117",
+    },
+}
+
+
+def _paleta_est() -> dict:
+    """Paleta do tema que o Streamlit está usando (claro/escuro); sem informação, a clara."""
+    try:
+        tipo = st.context.theme.type
+    except Exception:
+        tipo = None
+    return _PALETA_EST["dark" if tipo == "dark" else "light"]
+
+
+def _cor_texto(i: int, k: int, paleta: dict) -> str:
+    """Texto escuro sobre as cores claras da rampa, branco sobre as escuras (contraste do rótulo dentro da barra)."""
+    claras = paleta["claras"]
+    clara = i < claras if claras > 0 else i >= k + claras
+    return "#191919" if clara else "#ffffff"
+
+
+def _rampa(k: int, paleta: dict) -> list[str]:
+    """k cores da rampa sequencial, espaçadas por igual (valor menor -> primeira cor)."""
+    rampa = paleta["rampa"]
+    if k <= 1:
+        return [rampa[len(rampa) // 2]]
+    return [rampa[round(i * (len(rampa) - 1) / (k - 1))] for i in range(k)]
+
+
+def _fmt_valor(v: float) -> str:
+    return f"{v:.0f}" if float(v).is_integer() else f"{v:g}"
+
+
+def _grafico_da_variavel(escolha: str, tipo: str, tem_grupo: bool, n_distintos: int) -> tuple[str, str | None]:
+    """
+    (gráfico que vai ser desenhado, aviso ou None). O usuário escolhe; o
+    app desenha o que faz sentido pro tipo e diz o porquê quando troca.
+    """
+    recomendado = GRAFICO_BARRAS if tipo == se.TIPO_ESCALA else (GRAFICO_BOX if tem_grupo else GRAFICO_HIST)
+    if escolha == GRAFICO_RECOMENDADO:
+        return recomendado, None
+    if escolha == GRAFICO_BARRAS and tipo == se.TIPO_CONTINUA:
+        return recomendado, (f"Barras de distribuição servem pra escala; esta variável tem {n_distintos} valores "
+                             f"diferentes e as barras ficariam ilegíveis. Mostrando o recomendado ({recomendado.lower()}).")
+    if escolha == GRAFICO_HIST and tipo == se.TIPO_ESCALA:
+        return GRAFICO_BARRAS, "Na escala, o histograma é o próprio gráfico de barras (uma barra por nota)."
+    if escolha == GRAFICO_BOX and tipo == se.TIPO_ESCALA:
+        return GRAFICO_BOX, ("Cuidado: na escala, a caixa costuma ir de 3 a 4 em quase todo grupo e esconde a "
+                             "diferença (dos 15 índices, 10 têm a caixa igual). Compare pela média e pelas barras.")
+    return escolha, None
+
+
+def _grupos_do_grafico(tabela: pd.DataFrame, limite: int) -> list[str]:
+    """Grupos que entram no gráfico: todos se couberem, senão os de maior n (a tabela continua com todos)."""
+    grupos = [g for g in tabela.index if g != "Total"]
+    if not grupos:
+        return ["Total"]
+    if len(grupos) <= limite:
+        return grupos
+    return list(tabela.loc[grupos, "n"].sort_values(ascending=False).index[:limite])
+
+
+def _fig_barras(valores: pd.Series, pesos: pd.Series, grupos: pd.Series | None, nomes: list[str], titulo: str) -> go.Figure:
+    paleta = _paleta_est()
+    if grupos is None:
+        dist = se.distribuicao(valores, pesos)
+        fig = go.Figure(go.Bar(
+            x=[_fmt_valor(v) for v in dist.index], y=dist.values, marker_color=paleta["serie"][0],
+            text=[f"{p:.1f}%" for p in dist.values], textposition="outside",
+            hovertemplate="valor %{x}: %{y:.1f}%<extra></extra>",
+        ))
+        fig.update_layout(title=titulo, yaxis_title="% das entrevistas", xaxis_title="valor", height=380,
+                          showlegend=False, xaxis_type="category")
+        return fig
+    # com quebra: uma barra 100% por grupo, nota baixa -> alta na rampa sequencial
+    dists = {g: se.distribuicao(valores[(grupos == g).to_numpy()], pesos[(grupos == g).to_numpy()]) for g in nomes}
+    todos = sorted({v for d in dists.values() for v in d.index})
+    cores = _rampa(len(todos), paleta)
+    fig = go.Figure()
+    for i, (v, cor) in enumerate(zip(todos, cores)):
+        pcts = [float(dists[g].get(v, 0.0)) for g in nomes]
+        # cor do texto pela POSIÇÃO da cor na rampa usada (a rampa pode ter sido espaçada pra k notas)
+        pos_na_rampa = paleta["rampa"].index(cor)
+        fig.add_trace(go.Bar(
+            y=nomes, x=pcts, name=_fmt_valor(v), orientation="h", marker_color=cor,
+            marker_line=dict(width=1.5, color=paleta["vao"]),
+            text=[f"{p:.0f}%" if p >= 6 else "" for p in pcts], textposition="inside", insidetextanchor="middle",
+            insidetextfont=dict(color=_cor_texto(pos_na_rampa, len(paleta["rampa"]), paleta)),
+            hovertemplate="%{y} · valor " + _fmt_valor(v) + ": %{x:.1f}%<extra></extra>",
+        ))
+    fig.update_layout(barmode="stack", title=titulo, xaxis_title="% das entrevistas", height=max(260, 140 + 40 * len(nomes)),
+                      legend=dict(title_text="valor", orientation="h", traceorder="normal", y=1.02, yanchor="bottom", x=1, xanchor="right"),
+                      yaxis=dict(autorange="reversed", type="category"), xaxis_range=[0, 100], margin=dict(t=90))
+    return fig
+
+
+def _fig_histograma(valores: pd.Series, pesos: pd.Series, grupos: pd.Series | None, nomes: list[str], titulo: str) -> go.Figure:
+    from plotly.subplots import make_subplots
+
+    paleta = _paleta_est()
+    bordas, _ = se.histograma(valores, pesos)
+    centros, larguras = (bordas[:-1] + bordas[1:]) / 2, np.diff(bordas)
+    paineis = [("Total", None)] if grupos is None else [(g, (grupos == g).to_numpy()) for g in nomes]
+    fig = make_subplots(rows=len(paineis), cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                        subplot_titles=[g for g, _ in paineis] if grupos is not None else None)
+    for i, (g, mascara) in enumerate(paineis, start=1):
+        x, w = se.limpar(valores if mascara is None else valores[mascara], pesos if mascara is None else pesos[mascara])
+        soma, _ = np.histogram(x, bins=bordas, weights=w)
+        pct = soma / w.sum() * 100 if len(x) else soma
+        de, ate = bordas[:-1], bordas[1:]
+        fig.add_trace(go.Bar(
+            x=centros, y=pct, width=larguras, marker_color=paleta["serie"][0],
+            marker_line=dict(width=1, color=paleta["vao"]), name=g, showlegend=False,
+            customdata=np.column_stack([de, ate]),
+            hovertemplate=f"{g} · " + "de %{customdata[0]:g} a %{customdata[1]:g}: %{y:.1f}%<extra></extra>",
+        ), row=i, col=1)
+    fig.update_yaxes(title_text="%", title_standoff=4)
+    fig.update_layout(title=titulo, height=(380 if grupos is None else 70 + 150 * len(paineis)), bargap=0)
+    return fig
+
+
+def _fig_box(valores: pd.Series, pesos: pd.Series, grupos: pd.Series | None, nomes: list[str], titulo: str) -> go.Figure:
+    paleta = _paleta_est()
+    alvos = [("Total", None)] if grupos is None else [(g, (grupos == g).to_numpy()) for g in nomes]
+    caixas = [(g, se.caixa(valores if m is None else valores[m], pesos if m is None else pesos[m])) for g, m in alvos]
+    caixas = [(g, c) for g, c in caixas if c]
+    fig = go.Figure(go.Box(
+        x=[g for g, _ in caixas],
+        q1=[c["q1"] for _, c in caixas], median=[c["mediana"] for _, c in caixas], q3=[c["q3"] for _, c in caixas],
+        lowerfence=[c["bigode_inf"] for _, c in caixas], upperfence=[c["bigode_sup"] for _, c in caixas],
+        mean=[c["media"] for _, c in caixas], boxmean=True, marker_color=paleta["serie"][0], name="", showlegend=False,
+        hoverinfo="y",
+    ))
+    fora_x = [g for g, c in caixas for _ in c["fora"]]
+    fora_y = [v for _, c in caixas for v in c["fora"]]
+    if fora_y:
+        fig.add_trace(go.Scatter(x=fora_x, y=fora_y, mode="markers", marker=dict(color=paleta["serie"][0], size=6, opacity=0.6),
+                                 showlegend=False, hovertemplate="%{x}: %{y:g} (fora do bigode)<extra></extra>"))
+    fig.update_layout(title=titulo, height=420, xaxis_type="category", yaxis_title="valor")
+    return fig
+
+
+def _fig_dispersao(base: pd.DataFrame, var_x: str, var_y: str, grupos: pd.Series | None, nomes: list[str],
+                   rotulo_x: str, rotulo_y: str, jitter_x: bool, jitter_y: bool) -> tuple[go.Figure, int, int]:
+    """(figura, pontos desenhados, entrevistas com as duas respostas)."""
+    paleta = _paleta_est()
+    ambos = base[[var_x, var_y]].apply(pd.to_numeric, errors="coerce").notna().all(axis=1).to_numpy()
+    sub = base.loc[ambos]
+    pos = se.amostra_indices(len(sub), _PONTOS_DISPERSAO)
+    sub = sub.iloc[pos]
+    rng = np.random.default_rng(1)
+    x = pd.to_numeric(sub[var_x], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(sub[var_y], errors="coerce").to_numpy(dtype=float)
+    # escala tem poucos valores: sem tremer, milhares de pontos caem no mesmo lugar e parecem um só
+    if jitter_x:
+        x = x + rng.uniform(-0.18, 0.18, len(x))
+    if jitter_y:
+        y = y + rng.uniform(-0.18, 0.18, len(y))
+    fig = go.Figure()
+    g = None if grupos is None else grupos.loc[ambos].iloc[pos].astype("object").to_numpy()
+    if g is not None and len(nomes) <= len(paleta["serie"]):
+        for nome, cor in zip(nomes, paleta["serie"]):
+            m = g == nome
+            fig.add_trace(go.Scattergl(x=x[m], y=y[m], mode="markers", name=str(nome),
+                                       marker=dict(color=cor, size=5, opacity=0.45)))
+    else:
+        fig.add_trace(go.Scattergl(x=x, y=y, mode="markers", showlegend=False,
+                                   marker=dict(color=paleta["serie"][0], size=5, opacity=0.35)))
+    fig.update_layout(height=480, xaxis_title=rotulo_x, yaxis_title=rotulo_y,
+                      title=f"{rotulo_y} x {rotulo_x}", legend_title_text="grupo" if g is not None else None)
+    return fig, len(sub), int(ambos.sum())
+
+
+def _tabela_estatisticas(tabela: pd.DataFrame, escolhidas: list[str]):
+    """Só as colunas que o usuário marcou, na ordem de `ESTATISTICAS`, com rótulo e formato."""
+    colunas: list[tuple[str, str]] = []
+    for chave, rotulo in se.ESTATISTICAS:
+        if chave not in escolhidas:
+            continue
+        if chave == "ic":
+            colunas += [("ic_de", "IC 95% de"), ("ic_ate", "IC 95% até")]
+        else:
+            colunas.append((chave, rotulo))
+    out = tabela[[c for c, _ in colunas]].rename(columns=dict(colunas))
+    formatos = {r: ("{:,.0f}" if c in ("n", "n_efetivo") else "{:,.2f}") for c, r in colunas}
+    return out.style.format(formatos, na_rep="—")
+
+
+def _render_estatistica_tab(
+    data: pd.DataFrame,
+    meta: dict,
+    options: dict,
+    filtered_data: pd.DataFrame,
+    use_weighting: bool,
+    active_filters: dict,
+) -> None:
+    """
+    Aba 📐 Estatística, parte Descritivas: variáveis numéricas (as `_media`),
+    com quebra opcional por uma categórica. Usa a base já filtrada (SQL +
+    barra lateral) e o mesmo peso do resto do app. Testes de hipótese são
+    a próxima fase.
+    """
+    st.subheader("Estatística — descritivas das variáveis numéricas")
+    st.caption("Testes de hipótese (qui-quadrado, t, z) entram na próxima fase.")
+
+    numericas = [c for c in filtered_data.columns
+                 if c in meta and meta[c].var_type == VarType.SCALE_MEDIA and filtered_data[c].notna().any()]
+    if not numericas:
+        st.info("Nenhuma variável numérica com dado nessa base.")
+        return
+    label = {c: meta[c].label for c in numericas}
+    variaveis = st.multiselect(
+        "Variáveis numéricas", options=numericas, key="est_vars",
+        format_func=lambda c: f"{c} — {label[c]}" if label[c] != c else c,
+        help="Digite pra buscar pelo código ou pelo texto da pergunta. As numéricas do banco são as colunas `_media`.",
+        placeholder="ex.: F1_media (idade), IACOM_media, P50_media (nº de moradores)",
+    )
+    categoricas = [k for k in options if k in meta and meta[k].var_type in (VarType.SR, VarType.INDICATOR)]
+    col_q, col_c = st.columns([1, 2])
+    with col_q:
+        quebra = st.selectbox("Quebrar por (opcional)", [_SEM_QUEBRA] + categoricas, key="est_quebra",
+                              format_func=lambda k: k if k == _SEM_QUEBRA else options[k],
+                              help="Uma linha por categoria na tabela, e o gráfico por grupo. Só resposta única e indicador.")
+    with col_c:
+        calculos = st.multiselect(
+            "Cálculos", options=[k for k, _ in se.ESTATISTICAS], default=se.ESTATISTICAS_PADRAO, key="est_calc",
+            format_func=lambda k: dict(se.ESTATISTICAS)[k],
+        )
+    grafico = st.radio(
+        "Gráfico", _GRAFICOS_EST, horizontal=True, key="est_grafico",
+        help=("Recomendado: barras pra escala; histograma pra contínua (box plot quando há quebra). "
+              "Dispersão compara as DUAS primeiras variáveis escolhidas, uma contra a outra."),
+    )
+
+    peso_txt = ("⚖️ Ponderado pelo PESO (n e n efetivo são contagem de entrevistas)." if use_weighting
+                else "Sem peso: contagem bruta (o peso está desligado na barra lateral).")
+    st.caption(
+        f"{peso_txt} Escala = até {se.LIMITE_ESCALA} valores diferentes (ex.: nota de 1 a 5); o resto é contínua. "
+        "IC 95% = média ± t × erro padrão, com o peso considerado e (n efetivo − 1) graus de liberdade. "
+        "Amostra por cota: erro padrão e IC são a convenção de mercado (como se fosse sorteio) e servem pra "
+        "comparar a incerteza entre grupos, não como probabilidade de erro de verdade."
+    )
+    for linha in _filter_note_lines(active_filters, meta, max_valores=10):
+        st.caption(f"🔎 {linha}")
+
+    if not variaveis:
+        st.info("Escolha ao menos uma variável numérica acima.")
+        return
+    if not calculos:
+        st.info("Marque ao menos um cálculo.")
+        return
+
+    pesos = get_weights(filtered_data, meta, use_weighting)
+    grupos = None
+    ordem = None
+    if quebra != _SEM_QUEBRA:
+        grupos = get_column_series(filtered_data, quebra).astype("object")
+        ordem = sort_categories([str(v) for v in pd.unique(grupos.dropna())])
+        grupos = grupos.map(lambda v: str(v) if pd.notna(v) else None)
+
+    for var in variaveis:
+        valores = pd.to_numeric(filtered_data[var], errors="coerce")
+        tipo = se.tipo_numerica(valores)
+        n_distintos = int(valores.nunique())
+        st.markdown(f"#### {var} — {label[var]}")
+        st.caption(f"Tipo: **{tipo}** ({n_distintos} valores diferentes).")
+        tabela = se.descrever_por_grupo(valores, pesos, grupos, ordem_grupos=ordem)
+        vazios = [g for g in tabela.index if g != "Total" and tabela.loc[g, "n"] == 0]
+        if vazios:  # grupo sem nenhuma resposta = pergunta que não existiu ali (ex.: ano em que não foi feita)
+            tabela = tabela.drop(index=vazios)
+            st.caption(f"Sem resposta (fora da tabela e do gráfico): {', '.join(vazios)}.")
+        st.dataframe(_tabela_estatisticas(tabela, calculos), width="stretch", placeholder="—")
+        if grafico == GRAFICO_DISPERSAO:
+            continue
+        desenho, aviso = _grafico_da_variavel(grafico, tipo, grupos is not None, n_distintos)
+        if aviso:
+            st.caption(f"ℹ️ {aviso}")
+        limite = _MAX_GRUPOS_HIST if desenho == GRAFICO_HIST else _MAX_GRUPOS_GRAFICO
+        nomes = _grupos_do_grafico(tabela, limite)
+        if grupos is not None and len(tabela) - 1 > len(nomes):
+            st.caption(f"O gráfico mostra os {len(nomes)} grupos com mais entrevistas; a tabela mostra todos.")
+        titulo = var if grupos is None else f"{var} por {options[quebra]}"
+        if desenho == GRAFICO_BARRAS:
+            fig = _fig_barras(valores, pesos, grupos, nomes, titulo)
+        elif desenho == GRAFICO_HIST:
+            fig = _fig_histograma(valores, pesos, grupos, nomes, titulo)
+        else:
+            fig = _fig_box(valores, pesos, grupos, nomes, titulo)
+            st.caption("Linha cheia = mediana, tracejada = média; pontos = valores fora dos bigodes (1,5 × a altura da caixa).")
+        st.plotly_chart(fig, width="stretch", key=f"est_fig_{var}")
+
+    if grafico == GRAFICO_DISPERSAO:
+        st.markdown("#### Dispersão")
+        if len(variaveis) < 2:
+            st.info("A dispersão compara duas variáveis: escolha pelo menos duas acima (a 1ª vai no eixo X, a 2ª no Y).")
+            return
+        vx, vy = variaveis[0], variaveis[1]
+        nomes = []
+        if grupos is not None:
+            nomes = [g for g in ordem if g in set(grupos.dropna())]
+        fig, n_pontos, n_ambos = _fig_dispersao(
+            filtered_data,
+            vx, vy, grupos, nomes, vx, vy,
+            se.tipo_numerica(filtered_data[vx]) == se.TIPO_ESCALA, se.tipo_numerica(filtered_data[vy]) == se.TIPO_ESCALA,
+        )
+        st.plotly_chart(fig, width="stretch", key="est_fig_dispersao")
+        notas = [f"Amostra aleatória de {_fmt_int(n_pontos)} de {_fmt_int(n_ambos)} entrevistas com as duas respostas "
+                 "(com 100 mil pontos o gráfico vira uma mancha); cada ponto é uma entrevista, sem peso."]
+        if grupos is not None and len(nomes) > len(_paleta_est()["serie"]):
+            notas.append(f"Com {len(nomes)} grupos não dá pra separar por cor; todos os pontos estão na mesma cor.")
+        if se.tipo_numerica(filtered_data[vx]) == se.TIPO_ESCALA or se.tipo_numerica(filtered_data[vy]) == se.TIPO_ESCALA:
+            notas.append("Variável de escala: os pontos foram tremidos um pouco (±0,18) pra não caírem todos no mesmo lugar.")
+        st.caption(" ".join(notas))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2205,8 +2541,10 @@ def main() -> None:
     # `key` fixa a identidade das abas: sem ele, o aviso do filtro SQL que
     # aparece/some ACIMA das abas mudava a posição delas na página, e o
     # Streamlit voltava pra primeira aba a cada Aplicar/Limpar (visto no teste).
-    tab_cruzamento, tab_comparacao, tab_indices, tab_dados, tab_sql = st.tabs(
-        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "🩺 Diagnóstico de dados", "🔎 Filtro SQL"],
+    # Diagnóstico é a ÚLTIMA (decisão do Ro, 25/11): é a aba de olhar o dado
+    # cru, não de análise. Estatística fica junto das abas de análise.
+    tab_cruzamento, tab_comparacao, tab_indices, tab_estatistica, tab_sql, tab_dados = st.tabs(
+        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "📐 Estatística", "🔎 Filtro SQL", "🩺 Diagnóstico de dados"],
         key="abas_principais",
     )
     with tab_cruzamento:
@@ -2215,10 +2553,12 @@ def main() -> None:
         _render_comparacao_tab(data, meta, visible_options, filtered_data, na_handling, small_n_threshold, active_filters, use_weighting, use_universe)
     with tab_indices:
         _render_indices_tab(data, meta, visible_options, filtered_data, _filter_note_lines(active_filters, meta))
-    with tab_dados:
-        _render_dados_tab(data, meta, filtered_data)
+    with tab_estatistica:
+        _render_estatistica_tab(data, meta, visible_options, filtered_data, use_weighting, active_filters)
     with tab_sql:
         _render_sql_tab(data, meta, filtered_data, sql_mask)
+    with tab_dados:
+        _render_dados_tab(data, meta, filtered_data)
 
 
 if __name__ == "__main__":

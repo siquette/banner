@@ -952,6 +952,30 @@ def format_banner_table_full(blocks: list[BannerBlock]) -> pd.DataFrame:
     return table
 
 
+def mentions_per_respondent(blocks: list[BannerBlock]) -> pd.Series:
+    """
+    Índice de multiplicidade de um stub de MÚLTIPLA ESCOLHA: média de
+    opções marcadas por respondente, por coluna do banner. Índice da
+    série = (banner_label, categoria), o mesmo das colunas de
+    `format_banner_table_full`.
+
+    É a soma do %COLUNA da coluna dividida por 100: o %COLUNA de cada
+    opção já é (menções ponderadas) / (pessoas da base da coluna), então
+    a soma é menções / pessoas. Calculado do próprio `pct` de propósito
+    -- o número bate com a tabela por construção, não por coincidência.
+
+    A base é quem marcou ao menos uma opção (ver `eligible_respondents`):
+    o banco não separa "pulou a pergunta" de "não marcou nada", então o
+    índice nunca é menor que 1. Só faz sentido com stub MR; com SR dá 1
+    (ou menos, se houver N/A excluído) -- quem chama decide quando mostrar.
+    """
+    valores: dict[tuple[str, str], float] = {}
+    for b in blocks:
+        for cat, soma in (b.pct.sum(axis=0) / 100).items():
+            valores[(b.banner_label, cat)] = float(soma)
+    return pd.Series(valores, dtype=float)
+
+
 def _format_br_number(value: float, decimals: int) -> str:
     """
     Formata número no padrão pt-BR (milhar com ".", decimal com ",").

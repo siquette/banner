@@ -65,7 +65,14 @@ from crosstab_engine import (
     table_to_excel_bytes,
     variables_with_data,
 )
-from indices import compute_index_trend, compute_quadrant_data, indicator_media_map
+from indices import (
+    compute_index_cross,
+    compute_index_trend,
+    compute_quadrant_data,
+    indicator_media_map,
+    media_values,
+    neutral_imputation,
+)
 from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels, sort_categories
 from sql_filter import (
     LIMITE_SEGUNDOS,
@@ -1467,12 +1474,189 @@ def _render_indices_quadrant(filtered_data, meta, indicator_names, media_map, se
         st.caption(f"Fora do gráfico por falta de dado suficiente: {', '.join(faltando)}")
 
 
-def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_data: pd.DataFrame, notes: list[str] | None = None) -> None:
+_LINHAS_CRUZADO_PADRAO = "CIDADES"
+_MAX_DESTAQUES = 3
+_MAX_LINHAS_COLORIDAS = 8  # até aqui, cada linha ganha uma cor; acima, cinza + até 3 destacadas
+
+
+def _render_indices_cross(
+    filtered_data: pd.DataFrame,
+    meta: dict,
+    options: dict,
+    indicator_names: list[str],
+    media_map: dict,
+    segment_key: str,
+    weights: pd.Series,
+    small_n_threshold: int,
+    notes: list[str] | None = None,
+) -> None:
     """
-    Ponto de entrada da aba Índices: monta os controles comuns às três
+    Visão "Duas variáveis": UM índice cruzado por duas variáveis ao mesmo
+    tempo -- linhas à escolha (padrão CIDADES), colunas = "Segmentar por"
+    (padrão ANO). Pedido do Ro (26/11) pra fazer no app o que o HTML das
+    34 cidades PLENA fazia: cidade por ano.
+
+    Tabela com Total (linha e coluna) e células de n pequeno em amarelo,
+    como no banner. No gráfico, com muitas linhas (130 cidades) cada uma
+    colorida vira um emaranhado; por isso, acima de
+    `_MAX_LINHAS_COLORIDAS`, as linhas ficam cinza e o usuário destaca até
+    3 -- o mesmo desenho do HTML.
+    """
+    linhas_opcoes = [k for k, m in meta.items() if m.var_type == VarType.SR and k in options and k != segment_key]
+    if not linhas_opcoes:
+        st.info("Não há outra variável de resposta única pra cruzar.")
+        return
+    col_i, col_l = st.columns(2)
+    with col_i:
+        selected = st.selectbox("Índice", options=indicator_names, format_func=lambda k: meta[k].label, key="indices_cross_indice")
+    with col_l:
+        padrao = linhas_opcoes.index(_LINHAS_CRUZADO_PADRAO) if _LINHAS_CRUZADO_PADRAO in linhas_opcoes else 0
+        row_key = st.selectbox(
+            "Linhas", options=linhas_opcoes, index=padrao, format_func=lambda k: options.get(k, k), key="indices_cross_linhas",
+            help=f"As colunas são a variável de \"Segmentar por\", acima ({options.get(segment_key, segment_key)}).",
+        )
+    media_col = media_map[selected]
+    cross = compute_index_cross(filtered_data, meta, media_col, row_key, segment_key, weights)
+    if cross.empty:
+        st.info("Nenhuma combinação com entrevista nessa base.")
+        return
+
+    # margens: Total por coluna (todas as linhas) e por linha (todas as colunas), mesma conta
+    por_coluna = compute_index_trend(filtered_data, meta, media_col, segment_key, weights)
+    por_linha = compute_index_trend(filtered_data, meta, media_col, row_key, weights)
+    valores = media_values(filtered_data, media_col)
+    ok = valores.notna()
+    geral = float((valores[ok] * weights[ok]).sum() / weights[ok].sum()) if ok.any() else np.nan
+
+    linhas = sort_categories([str(v) for v in cross.index.get_level_values(0).unique()])
+    colunas = sort_categories([str(v) for v in cross.index.get_level_values(1).unique()])
+    plano = cross.copy()
+    plano.index = pd.MultiIndex.from_tuples([(str(a), str(b)) for a, b in plano.index])
+    medias = plano["media"].unstack().reindex(index=linhas, columns=colunas)
+    ns = plano["n"].unstack().reindex(index=linhas, columns=colunas)
+    por_linha.index = por_linha.index.map(str)
+    por_coluna.index = por_coluna.index.map(str)
+    medias["Total"] = por_linha["media"].reindex(linhas)
+    ns["Total"] = por_linha["n"].reindex(linhas)
+    medias.loc["Total"] = list(por_coluna["media"].reindex(colunas)) + [geral]
+    ns.loc["Total"] = list(por_coluna["n"].reindex(colunas)) + [int(ok.sum())]
+    medias = medias.reindex(["Total"] + linhas)
+    ns = ns.reindex(["Total"] + linhas)
+    medias.index.name, medias.columns.name = options.get(row_key, row_key), options.get(segment_key, segment_key)
+
+    regra = neutral_imputation(media_col)
+    st.caption(
+        f"**{meta[selected].label}** — média do índice (escala 1-5) por {options.get(row_key, row_key)} e "
+        f"{options.get(segment_key, segment_key)}. Célula em amarelo = menos de {small_n_threshold} entrevistas "
+        "(limiar da barra lateral). '—' = combinação sem entrevista."
+        + (f" Regra do índice: quem não respondeu entra como {regra:g}." if regra is not None else "")
+    )
+    st.caption(
+        "💡 O Total de cada coluna muda conforme as linhas que existem naquela coluna (ex.: cidades que entraram "
+        "ou saíram num ano). Pra comparar ano contra ano sem esse efeito, aplique antes o filtro SQL das cidades "
+        "presentes em todos os anos (está nos exemplos da aba 🔎 Filtro SQL)."
+    )
+
+    view = st.radio("Mostrar como", ["Gráfico", "Tabela"], horizontal=True, key="indices_cross_view")
+    if view == "Tabela":
+        pequeno = ns.lt(small_n_threshold) & ns.notna()
+
+        def _amarelo(_: pd.DataFrame) -> pd.DataFrame:
+            return pequeno.map(lambda f: "background-color: #fff3cd; color: #000000" if f else "")
+
+        st.dataframe(medias.style.apply(_amarelo, axis=None).format("{:.2f}", na_rep="—"), width="stretch", placeholder="—")
+        if st.checkbox("Mostrar o n de cada célula", key="indices_cross_mostrar_n"):
+            st.dataframe(ns.style.format("{:,.0f}", na_rep="—"), width="stretch", placeholder="—")
+    else:
+        _render_indices_cross_chart(medias.drop(columns="Total"), ns.drop(columns="Total"), small_n_threshold,
+                                    meta[selected].label, options.get(segment_key, segment_key))
+
+    # exportação: grade das médias (Excel) e tabela longa com n e cobertura (CSV)
+    notas = list(notes or []) + [
+        f"Índice: {meta[selected].label}. Linhas: {options.get(row_key, row_key)}. Colunas: {options.get(segment_key, segment_key)}.",
+        f"Células com menos de {small_n_threshold} entrevistas: leia com cautela.",
+    ] + ([f"Regra do índice: quem não respondeu entra como {regra:g}."] if regra is not None else [])
+    longa = cross.reset_index().rename(columns={"media": "média", "cobertura_pct": "cobertura (%)"})
+    nome = f"{selected}_por_{row_key}_e_{segment_key}"
+    col_csv, col_xlsx = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "Baixar com n e cobertura (CSV)",
+            data=(longa.to_csv(index=False) + "\n" + "\n".join(['"Notas"'] + ['"' + n.replace('"', "'") + '"' for n in notas]) + "\n").encode("utf-8"),
+            file_name=f"{nome}.csv", mime="text/csv", key="download_indices_cross_csv",
+        )
+    with col_xlsx:
+        st.download_button(
+            "Baixar a tabela (Excel)",
+            data=table_to_excel_bytes(medias, sheet_name="Índice", default_format="#,##0.00", notes=notas),
+            file_name=f"{nome}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_indices_cross_xlsx",
+        )
+
+
+def _render_indices_cross_chart(medias: pd.DataFrame, ns: pd.DataFrame, small_n_threshold: int, titulo: str, eixo_x: str) -> None:
+    """Uma linha por categoria das linhas ao longo das colunas; Total tracejado. Muitas linhas: cinza + até 3 destacadas."""
+    paleta = _paleta_est()
+    categorias = [r for r in medias.index if r != "Total"]
+    colorir_todas = len(categorias) <= _MAX_LINHAS_COLORIDAS
+    destaques: list[str] = []
+    if not colorir_todas:
+        destaques = st.multiselect(
+            f"Destacar no gráfico (até {_MAX_DESTAQUES})", options=categorias, max_selections=_MAX_DESTAQUES,
+            key="indices_cross_destaques", help="As outras ficam em cinza, de fundo, pra dar a referência sem embaralhar.",
+        )
+    cores = {c: paleta["serie"][i] for i, c in enumerate(categorias if colorir_todas else destaques)}
+    x = list(medias.columns)
+    fig = go.Figure()
+
+    def _linha(nome: str, cor: str, largura: float, tracejado: bool = False, legenda: bool = True, por_cima: bool = True) -> None:
+        y = medias.loc[nome].to_numpy(dtype=float)
+        n = ns.loc[nome].to_numpy(dtype=float)
+        # ponto vazado = célula com n pequeno (mesmo aviso do amarelo na tabela)
+        simbolos = ["circle-open" if (not np.isnan(v) and v < small_n_threshold) else "circle" for v in n]
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode="lines+markers", name=nome, showlegend=legenda, connectgaps=False,
+            line=dict(color=cor, width=largura, dash="dash" if tracejado else "solid"),
+            marker=dict(size=7 if por_cima else 4, color=cor, symbol=simbolos),
+            customdata=np.nan_to_num(n, nan=0).astype(int),
+            hovertemplate=f"{nome} · " + "%{x}: %{y:.2f} (n=%{customdata})<extra></extra>",
+            opacity=1.0 if por_cima else 0.9,
+        ))
+
+    if not colorir_todas:
+        for c in categorias:
+            if c not in destaques:
+                _linha(c, paleta["contexto"], 1, legenda=False, por_cima=False)
+    for c in (categorias if colorir_todas else destaques):
+        _linha(c, cores[c], 2.5)
+    _linha("Total", paleta["tinta"], 3, tracejado=True)
+    fig.update_layout(title=titulo, height=480, xaxis=dict(type="category", title=eixo_x), yaxis_title="média (1-5)",
+                      legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1, xanchor="right"), margin=dict(t=90))
+    st.plotly_chart(fig, width="stretch", key="indices_cross_fig")
+    texto = "Total = tracejado. Ponto vazado = menos de " + f"{small_n_threshold} entrevistas naquela célula."
+    if not colorir_todas:
+        texto += f" Linhas em cinza = as outras {len(categorias) - len(destaques)} (passe o mouse pra ver o nome)."
+    st.caption(texto)
+
+
+def _render_indices_tab(
+    data: pd.DataFrame,
+    meta: dict,
+    options: dict,
+    filtered_data: pd.DataFrame,
+    notes: list[str] | None = None,
+    use_weighting: bool = True,
+    small_n_threshold: int = 30,
+) -> None:
+    """
+    Ponto de entrada da aba Índices: monta os controles comuns às quatro
     visões (segmento, seletor de visão) e despacha pra
-    `_render_indices_overview`/`_individual`/`_quadrant` conforme
+    `_render_indices_overview`/`_individual`/`_cross`/`_quadrant` conforme
     escolhido.
+
+    Peso: desde 26/11 segue a chave da barra lateral, como o resto do app
+    (antes era sempre ponderado). Decisão do Ro, pra um índice não ter um
+    número aqui e outro na aba Estatística com o peso desligado.
     """
     full_media_map = indicator_media_map(meta)
     if not full_media_map:
@@ -1505,13 +1689,15 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
             help="Só variáveis de resposta única -- segmentar índice por múltipla resposta não tem definição óbvia (a pessoa contaria em mais de um segmento ao mesmo tempo).",
         )
     with col2:
-        view_mode = st.radio("Visualização", ["Visão geral", "Índice individual", "Quadrante"], horizontal=True)
+        view_mode = st.radio("Visualização", ["Visão geral", "Índice individual", "Duas variáveis", "Quadrante"], horizontal=True)
 
-    weights = get_weights(filtered_data, meta)
+    weights = get_weights(filtered_data, meta, use_weighting)
+    st.caption("⚖️ Médias ponderadas pelo PESO." if use_weighting
+               else "Sem peso: médias simples (o peso está desligado na barra lateral).")
 
     with st.expander("❓ Como ler esse painel"):
         st.markdown(
-            "- Cada índice (`IACOM`, `IMC`, `IM`...) é uma **média ponderada** (não % de "
+            "- Cada índice (`IACOM`, `IMC`, `IM`...) é uma **média** -- ponderada pelo PESO quando o peso está ligado -- (não % de "
             "categoria) na escala 1-5, calculada a partir do companion numérico "
             "(`_media`) que fica por trás da versão categórica que aparece na aba "
             "Cruzamento.\n"
@@ -1526,6 +1712,8 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
         _render_indices_overview(filtered_data, meta, options, indicator_names, media_map, segment_key, weights, notes)
     elif view_mode == "Índice individual":
         _render_indices_individual(filtered_data, meta, options, indicator_names, media_map, segment_key, weights)
+    elif view_mode == "Duas variáveis":
+        _render_indices_cross(filtered_data, meta, options, indicator_names, media_map, segment_key, weights, small_n_threshold, notes)
     else:  # Quadrante
         _render_indices_quadrant(filtered_data, meta, indicator_names, media_map, segment_key, weights)
 
@@ -1676,6 +1864,8 @@ _PALETA_EST = {
         "rampa": ["#84b9f3", "#519ced", "#257de0", "#1b64be", "#0f4a96"],
         "claras": 2,  # quantas cores do começo da rampa pedem texto escuro em cima
         "vao": "#ffffff",
+        "contexto": "#cfcfcf",  # linhas de fundo (as cidades não destacadas)
+        "tinta": "#191919",
     },
     "dark": {
         "serie": ["#338ced", "#e76624", "#00a888", "#d28e05", "#e24d8b", "#0aac23", "#9887ef", "#eb6263"],
@@ -1683,6 +1873,8 @@ _PALETA_EST = {
         "rampa": ["#1757ac", "#2370cd", "#338ced", "#6aabf1", "#9dc8f7"],
         "claras": -2,  # as 2 ÚLTIMAS cores são claras e pedem texto escuro
         "vao": "#0e1117",
+        "contexto": "#3d3d3d",
+        "tinta": "#efefef",
     },
 }
 
@@ -1824,17 +2016,15 @@ def _fig_box(valores: pd.Series, pesos: pd.Series, grupos: pd.Series | None, nom
     return fig
 
 
-def _fig_dispersao(base: pd.DataFrame, var_x: str, var_y: str, grupos: pd.Series | None, nomes: list[str],
+def _fig_dispersao(serie_x: pd.Series, serie_y: pd.Series, grupos: pd.Series | None, nomes: list[str],
                    rotulo_x: str, rotulo_y: str, jitter_x: bool, jitter_y: bool) -> tuple[go.Figure, int, int]:
-    """(figura, pontos desenhados, entrevistas com as duas respostas)."""
+    """(figura, pontos desenhados, entrevistas com as duas respostas). Séries já lidas com a regra do índice."""
     paleta = _paleta_est()
-    ambos = base[[var_x, var_y]].apply(pd.to_numeric, errors="coerce").notna().all(axis=1).to_numpy()
-    sub = base.loc[ambos]
-    pos = se.amostra_indices(len(sub), _PONTOS_DISPERSAO)
-    sub = sub.iloc[pos]
+    ambos = (serie_x.notna() & serie_y.notna()).to_numpy()
+    pos = se.amostra_indices(int(ambos.sum()), _PONTOS_DISPERSAO)
     rng = np.random.default_rng(1)
-    x = pd.to_numeric(sub[var_x], errors="coerce").to_numpy(dtype=float)
-    y = pd.to_numeric(sub[var_y], errors="coerce").to_numpy(dtype=float)
+    x = serie_x.to_numpy(dtype=float)[ambos][pos]
+    y = serie_y.to_numpy(dtype=float)[ambos][pos]
     # escala tem poucos valores: sem tremer, milhares de pontos caem no mesmo lugar e parecem um só
     if jitter_x:
         x = x + rng.uniform(-0.18, 0.18, len(x))
@@ -1852,7 +2042,7 @@ def _fig_dispersao(base: pd.DataFrame, var_x: str, var_y: str, grupos: pd.Series
                                    marker=dict(color=paleta["serie"][0], size=5, opacity=0.35)))
     fig.update_layout(height=480, xaxis_title=rotulo_x, yaxis_title=rotulo_y,
                       title=f"{rotulo_y} x {rotulo_x}", legend_title_text="grupo" if g is not None else None)
-    return fig, len(sub), int(ambos.sum())
+    return fig, len(pos), int(ambos.sum())
 
 
 def _tabela_estatisticas(tabela: pd.DataFrame, escolhidas: list[str]):
@@ -1943,11 +2133,14 @@ def _render_estatistica_tab(
         grupos = grupos.map(lambda v: str(v) if pd.notna(v) else None)
 
     for var in variaveis:
-        valores = pd.to_numeric(filtered_data[var], errors="coerce")
+        # `media_values` = a mesma leitura da aba Índices (ex.: no IACOM, vazio vira 3) -- um índice, um número só
+        valores = media_values(filtered_data, var)
         tipo = se.tipo_numerica(valores)
         n_distintos = int(valores.nunique())
         st.markdown(f"#### {var} — {label[var]}")
-        st.caption(f"Tipo: **{tipo}** ({n_distintos} valores diferentes).")
+        regra = neutral_imputation(var)
+        st.caption(f"Tipo: **{tipo}** ({n_distintos} valores diferentes)."
+                   + (f" Regra do índice: quem não respondeu entra como {regra:g}, a mesma conta da aba Índices." if regra is not None else ""))
         tabela = se.descrever_por_grupo(valores, pesos, grupos, ordem_grupos=ordem)
         vazios = [g for g in tabela.index if g != "Total" and tabela.loc[g, "n"] == 0]
         if vazios:  # grupo sem nenhuma resposta = pergunta que não existiu ali (ex.: ano em que não foi feita)
@@ -1982,17 +2175,17 @@ def _render_estatistica_tab(
         nomes = []
         if grupos is not None:
             nomes = [g for g in ordem if g in set(grupos.dropna())]
+        serie_x, serie_y = media_values(filtered_data, vx), media_values(filtered_data, vy)
         fig, n_pontos, n_ambos = _fig_dispersao(
-            filtered_data,
-            vx, vy, grupos, nomes, vx, vy,
-            se.tipo_numerica(filtered_data[vx]) == se.TIPO_ESCALA, se.tipo_numerica(filtered_data[vy]) == se.TIPO_ESCALA,
+            serie_x, serie_y, grupos, nomes, vx, vy,
+            se.tipo_numerica(serie_x) == se.TIPO_ESCALA, se.tipo_numerica(serie_y) == se.TIPO_ESCALA,
         )
         st.plotly_chart(fig, width="stretch", key="est_fig_dispersao")
         notas = [f"Amostra aleatória de {_fmt_int(n_pontos)} de {_fmt_int(n_ambos)} entrevistas com as duas respostas "
                  "(com 100 mil pontos o gráfico vira uma mancha); cada ponto é uma entrevista, sem peso."]
         if grupos is not None and len(nomes) > len(_paleta_est()["serie"]):
             notas.append(f"Com {len(nomes)} grupos não dá pra separar por cor; todos os pontos estão na mesma cor.")
-        if se.tipo_numerica(filtered_data[vx]) == se.TIPO_ESCALA or se.tipo_numerica(filtered_data[vy]) == se.TIPO_ESCALA:
+        if se.tipo_numerica(serie_x) == se.TIPO_ESCALA or se.tipo_numerica(serie_y) == se.TIPO_ESCALA:
             notas.append("Variável de escala: os pontos foram tremidos um pouco (±0,18) pra não caírem todos no mesmo lugar.")
         st.caption(" ".join(notas))
 
@@ -2432,8 +2625,8 @@ def _render_sidebar(
             "Aplicar peso amostral (PESO)",
             value=True,
             help=(
-                "Desligado por padrão: %LINHA/%COLUNA usam contagem bruta (NA), sem "
-                "peso amostral -- é o padrão de referência usado hoje. O peso amostral "
+                "Ligado por padrão. Desligado, o app inteiro (%LINHA/%COLUNA, Índices, "
+                "Estatística) usa contagem bruta, sem peso amostral. O peso amostral "
                 "é calibrado pra representar o universo TOTAL do estudo; dentro de um "
                 "recorte já filtrado (ex.: uma diretoria específica), reaplicar esse "
                 "mesmo peso pode inflar/distorcer a proporção entre categorias, porque "
@@ -2531,7 +2724,7 @@ def main() -> None:
     if use_weighting:
         st.info("⚖️ **Peso amostral LIGADO** — percentuais ponderados pelo PESO (NA segue contagem bruta).")
     else:
-        st.warning("⚖️ **Peso amostral DESLIGADO** — Cruzamento e Comparar em contagem bruta, sem ponderar. A aba Índices é sempre ponderada. Pra ponderar, ligue em \"3. Regras\" na barra lateral.")
+        st.warning("⚖️ **Peso amostral DESLIGADO** — o app inteiro (Cruzamento, Comparar, Índices e Estatística) em contagem bruta, sem ponderar. Pra ponderar, ligue em \"3. Regras\" na barra lateral.")
 
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
@@ -2552,7 +2745,8 @@ def main() -> None:
     with tab_comparacao:
         _render_comparacao_tab(data, meta, visible_options, filtered_data, na_handling, small_n_threshold, active_filters, use_weighting, use_universe)
     with tab_indices:
-        _render_indices_tab(data, meta, visible_options, filtered_data, _filter_note_lines(active_filters, meta))
+        _render_indices_tab(data, meta, visible_options, filtered_data, _filter_note_lines(active_filters, meta),
+                            use_weighting, small_n_threshold)
     with tab_estatistica:
         _render_estatistica_tab(data, meta, visible_options, filtered_data, use_weighting, active_filters)
     with tab_sql:

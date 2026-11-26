@@ -125,6 +125,21 @@ def _media_values(data: pd.DataFrame, media_col: str) -> pd.Series:
     return value
 
 
+def media_values(data: pd.DataFrame, media_col: str) -> pd.Series:
+    """
+    Versão pública de `_media_values`, pra quem está FORA deste módulo
+    (a aba Estatística) ler um `_media` com a mesma regra dos índices.
+    Existe porque, sem ela, a Estatística lia o IACOM cru e o mesmo
+    índice dava 3,37 lá e 3,25 aqui (banco de 2026 inteiro, com peso).
+    """
+    return _media_values(data, media_col)
+
+
+def neutral_imputation(media_col: str) -> float | None:
+    """Nota que entra no lugar do vazio nesse `_media` (ex.: 3,0 no IACOM), ou None se não há regra."""
+    return _NEUTRAL_IMPUTATION.get(media_col)
+
+
 def compute_index_trend(
     data: pd.DataFrame,
     meta: dict[str, VariableMeta],
@@ -165,6 +180,55 @@ def compute_index_trend(
     media = (weighted_sum / weight_sum).reindex(total_n.index)
 
     return pd.DataFrame({"media": media, "cobertura_pct": coverage_pct, "n": covered_n})
+
+
+def compute_index_cross(
+    data: pd.DataFrame,
+    meta: dict[str, VariableMeta],
+    media_col: str,
+    row_key: str,
+    col_key: str,
+    weights: pd.Series,
+) -> pd.DataFrame:
+    """
+    O mesmo que `compute_index_trend`, mas segmentado por DUAS variáveis
+    ao mesmo tempo (ex.: CIDADES nas linhas, ANO nas colunas) -- a visão
+    "Duas variáveis" da aba Índices.
+
+    Devolve um DataFrame longo, indexado por (linha, coluna), com as
+    mesmas colunas de `compute_index_trend`: `media` (ponderada),
+    `cobertura_pct` e `n` (não ponderados). Só aparecem as combinações
+    que existem no dado (cidade que não foi pesquisada num ano não vira
+    linha com zero). As contas são as de `compute_index_trend`, linha a
+    linha -- `tests/test_indices_cruzado.py` confere isso: o resultado
+    de uma cidade aqui tem que ser igual ao de `compute_index_trend`
+    rodado só nas entrevistas dessa cidade.
+    """
+    for key in (row_key, col_key):
+        if meta[key].var_type != VarType.SR:
+            raise ValueError(f"'{key}' não é resposta única -- segmentação de índice só suporta SR.")
+
+    df = pd.DataFrame({
+        "value": _media_values(data, media_col),
+        "row": get_column_series(data, meta[row_key].name),
+        "col": get_column_series(data, meta[col_key].name),
+        "weight": weights,
+    })
+    df = df[df["row"].notna() & df["col"].notna()]
+    chaves = ["row", "col"]
+
+    total_n = df.groupby(chaves, observed=True).size()
+    covered = df[df["value"].notna()]
+    covered_n = covered.groupby(chaves, observed=True).size().reindex(total_n.index).fillna(0).astype(int)
+    coverage_pct = (covered_n / total_n * 100).fillna(0.0)
+
+    weighted_sum = (covered["value"] * covered["weight"]).groupby([covered["row"], covered["col"]], observed=True).sum()
+    weight_sum = covered.groupby(chaves, observed=True)["weight"].sum()
+    media = (weighted_sum / weight_sum).reindex(total_n.index)
+
+    out = pd.DataFrame({"media": media, "cobertura_pct": coverage_pct, "n": covered_n})
+    out.index = out.index.set_names([row_key, col_key])
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -19,6 +19,7 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 - [Como atualizar o banco](#como-atualizar-o-banco)
 - [Como fazer deploy](#como-fazer-deploy)
 - [Estatística](#estatística)
+- [Índices: duas variáveis](#índices-duas-variáveis)
 - [Filtro SQL](#filtro-sql)
 - [Arquitetura](#arquitetura)
 - [Convenções de dado descobertas](#convenções-de-dado-descobertas)
@@ -205,12 +206,35 @@ caírem todos no mesmo lugar.
 Grupo sem nenhuma resposta (ex.: ano em que a pergunta não foi feita) sai
 da tabela, com aviso. Respeita o filtro SQL e os da barra lateral.
 
+**Índices na Estatística:** as colunas de índice são lidas com a mesma regra
+da aba Índices (no IACOM, quem não teve contato com a comunicação entra
+como nota 3), pra o mesmo índice dar o mesmo número nas duas abas.
+
 **Índice de multiplicidade** (no Cruzamento): quando a variável de linha é
 de múltipla escolha, aparece embaixo do banner a média de opções marcadas
 por respondente, por coluna, e ela vai pras Notas da exportação. É a soma
 do %COLUNA ÷ 100, então bate com a tabela. A base é quem marcou pelo menos
 uma opção (o banco não separa quem pulou a pergunta), por isso o índice
 nunca fica abaixo de 1.
+
+## Índices: duas variáveis
+
+Na aba **📈 Índices**, a visão **Duas variáveis** cruza UM índice por duas
+variáveis ao mesmo tempo -- ex.: cidade nas linhas e ano nas colunas. As
+colunas são a variável de "Segmentar por"; as linhas, a que você escolher
+(padrão CIDADES).
+
+- **Tabela:** média do índice por célula, com Total por linha e por coluna;
+  célula com menos entrevistas que o limiar da barra lateral fica em
+  amarelo (como no banner). Dá pra ver o n de cada célula.
+- **Gráfico:** uma linha por categoria ao longo das colunas, Total
+  tracejado. Com mais de 8 linhas (ex.: 130 cidades), todas ficam em cinza
+  e você destaca até 3. Ponto vazado = célula com n pequeno.
+- **Exportação:** a grade em Excel e uma tabela longa em CSV com média, n e
+  cobertura de cada combinação, com os filtros nas Notas.
+- O Total de cada ano muda conforme as cidades que entraram naquele ano.
+  Pra comparar ano contra ano sem esse efeito, use antes o filtro SQL das
+  cidades presentes em todos os anos (exemplo pronto na aba Filtro SQL).
 
 ## Filtro SQL
 
@@ -363,8 +387,9 @@ Padrões que não são óbvios e custaram investigação contra o banco real
   (PESO)", em "3. Regras"), **ligado por padrão**, com um aviso fixo no
   topo do app dizendo se o peso está ligado ou desligado -- pra ninguém
   analisar dado ponderado sem saber. Ligado, o % usa a coluna `PESO` (ou
-  1.0 uniforme se não houver); desligado, usa contagem bruta. A aba
-  Índices é **sempre** ponderada, independente do toggle. **NA/Base
+  1.0 uniforme se não houver); desligado, usa contagem bruta. Vale pro
+  app inteiro, inclusive Índices e Estatística (até 25/11 a aba Índices
+  era sempre ponderada; desde 26/11 segue a chave). **NA/Base
   Amostra é sempre não ponderado** -- é o N real que diz se uma célula é
   estatisticamente confiável, não o N ponderado (que pode parecer maior
   ou menor que a realidade).

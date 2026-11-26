@@ -1001,6 +1001,7 @@ def table_to_excel_bytes(
     sheet_name: str = "Dados",
     default_format: str = "#,##0.00",
     column_formats: dict[str, str] | None = None,
+    notes: list[str] | None = None,
 ) -> bytes:
     """
     Serializa um DataFrame "achatado" (índice e colunas de 1 nível só,
@@ -1019,6 +1020,9 @@ def table_to_excel_bytes(
     `column_formats`: código de formato por nome de coluna, pra tabelas
     com colunas de precisão diferente (ex.: "Média" com 2 casas, "N"
     como inteiro) -- coluna fora do dict cai em `default_format`.
+
+    `notes`: linhas de texto abaixo da tabela (ex.: o filtro de base
+    aplicado), como em `banner_table_to_excel_bytes`.
     """
     import io
 
@@ -1045,6 +1049,12 @@ def table_to_excel_bytes(
             if pd.notna(val):
                 cell = ws.cell(row=i + 2, column=j + 2, value=float(val))
                 cell.number_format = column_formats.get(col_name, default_format)
+
+    if notes:
+        note_row = len(df) + 3
+        ws.cell(row=note_row, column=1, value="Notas").font = bold
+        for i, text in enumerate(notes, start=1):
+            ws.cell(row=note_row + i, column=1, value=text)
 
     ws.freeze_panes = "B2"
     ws.column_dimensions["A"].width = 42

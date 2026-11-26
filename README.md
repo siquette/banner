@@ -18,6 +18,7 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 - [Como rodar localmente](#como-rodar-localmente)
 - [Como atualizar o banco](#como-atualizar-o-banco)
 - [Como fazer deploy](#como-fazer-deploy)
+- [Filtro SQL](#filtro-sql)
 - [Arquitetura](#arquitetura)
 - [Convenções de dado descobertas](#convenções-de-dado-descobertas)
 - [Convenções estatísticas](#convenções-estatísticas)
@@ -31,7 +32,7 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 ```
 app.py, metadata.py,        código do app -- fica na raiz porque o Streamlit
 crosstab_engine.py,         Cloud exige `app.py` na raiz (Main file path) e
-indices.py                  os módulos se importam entre si pelo nome
+indices.py, sql_filter.py   os módulos se importam entre si pelo nome
 requirements.txt            o que o Streamlit Cloud lê pra montar o ambiente
 pixi.toml / pixi.lock       ambiente local
 data/
@@ -150,6 +151,78 @@ de coluna antes de escrever o parquet (ver `_optimize_memory` no
 código) -- sem isso, o banco de produção projetava ~1,3GB só pra existir
 carregado, estourando o limite antes de qualquer conta rodar.
 
+## Filtro SQL
+
+Aba **🔎 Filtro SQL** (a última). Serve pra recorte que a barra lateral não
+faz: OR, número (`PESO > 1.5`), múltipla escolha, e condição que depende
+de outras linhas ("cidades presentes nos 5 anos"). É pra quem já sabe SQL.
+
+**Como usar**
+
+1. Escreva só a **condição** -- o que viria depois do `WHERE`. A tabela se
+   chama `dados`.
+2. Clique **Aplicar**. A partir daí o filtro vale pro app inteiro.
+3. **Limpar filtro** (na aba, no aviso do topo ou na barra lateral) tira o
+   filtro. Com a caixa vazia, o app funciona como antes.
+
+**Regras de escrita**
+
+- Coluna = **código** da pergunta (`P25`, `OPERACAO`), não o texto. O
+  código não tem acento. Pra achar o código, use "Procurar o código da
+  pergunta", dentro da aba (busca pelo código ou por palavras da pergunta).
+- Código com ponto, hífen ou espaço vai entre **aspas duplas**: `"P29.1"`,
+  `"P46.1-Outros"`. A coluna "como escrever" da busca já mostra pronto.
+- Valor de texto vai entre **aspas simples**: `OPERACAO = 'PLENA'`.
+  Maiúscula e acento contam (`'Plena'` não acha nada).
+- `ANO` é texto: `ANO = '2025'`.
+- Múltipla escolha é verdadeiro/falso: `"P46.1-Outros"` sozinho = quem
+  marcou. Cuidado: `NOT "P46.1-Outros"` inclui quem nunca recebeu a
+  pergunta.
+- Uma condição só: sem `;` e sem comentário.
+
+**Exemplos**
+
+```sql
+OPERACAO = 'PLENA' AND ANO IN ('2024', '2025')
+"P21.7_media" >= 4 AND PESO > 0.5
+lower(CIDADES) LIKE '%rio%'
+CIDADES IN (SELECT CIDADES FROM dados WHERE OPERACAO = 'PLENA'
+            GROUP BY CIDADES HAVING COUNT(DISTINCT ANO) = 5)
+AND OPERACAO = 'PLENA'
+```
+
+**Como ele se combina com o resto**
+
+- O SQL é o **primeiro** filtro e roda sobre o **banco inteiro**. Os
+  filtros da barra lateral vêm depois, em cascata, já só com os valores
+  que sobraram. (Se o SQL rodasse depois, uma subconsulta como "presente
+  em todos os anos" daria errado com ANO filtrado na barra lateral.)
+- Vale pras cinco abas. A coluna "Total geral (sem filtro)" do banner
+  aparece quando há filtro SQL.
+- Enquanto houver filtro SQL, um **aviso fixo** fica no topo de todas as
+  abas e na barra lateral, com a condição e o número de entrevistas.
+- A condição e os filtros da barra lateral vão escritos **embaixo do
+  banner** e nas **Notas** do CSV/Excel (banner e índices).
+
+**A tabela da aba**
+
+- Colunas escolhidas por você (já vêm ID_UNICO, ANO, OPERACAO, CIDADES e as
+  colunas que a condição usa). Passe o mouse no nome da coluna pra ver a
+  pergunta.
+- De 1 a 1.000 linhas, pra página não pesar.
+- A caixinha "Somar os filtros da barra lateral" escolhe entre a base
+  final (o que o cruzamento usa) e só o resultado do SQL. Ela muda só a
+  tabela, não o filtro do app.
+
+**Proteções** (detalhe em `sql_filter.py`): sem acesso a arquivo,
+internet ou configuração; a única tabela visível é `dados`; limite de
+memória e de 10 s por condição; condição que não deixa ninguém na base
+não é aplicada. As colunas retiradas do app (IMCE/IMCT) não existem na
+tabela `dados`. Erro aparece em português; a mensagem original do DuckDB
+fica num campo que abre e fecha, pra quem quiser conferir.
+
+**Dependência:** `duckdb` (testado com 1.5.3 e 2.0.1).
+
 ## Arquitetura
 
 ```
@@ -157,6 +230,7 @@ metadata.py            classifica cada coluna (SR/MR/indicador/peso/...)
         │
         ├──> crosstab_engine.py     motor de cruzamento ponderado
         ├──> indices.py             tendência/quadrante dos índices
+sql_filter.py          filtro SQL (DuckDB): condição -> máscara de linhas
         │
 tools/convert_to_parquet.py   script offline: xlsx -> parquet otimizado
 tools/list_variables.py       script offline: audita a classificação
@@ -170,7 +244,8 @@ app.py                  interface Streamlit (só orquestra, não calcula)
 | `metadata.py` | Lê o cabeçalho duplo do Excel e classifica cada coluna: resposta única (SR), múltipla resposta (MR), indicador pré-categorizado, ou companion numérico (`_media`). Todo o resto do projeto depende do dicionário `dict[str, VariableMeta]` que esse módulo produz. |
 | `crosstab_engine.py` | Motor de cruzamento ponderado. Normaliza qualquer variável (SR ou MR) pro mesmo formato longo (`resp_id \| category \| weight`) antes de cruzar -- é isso que elimina a necessidade de pivotar múltipla resposta manualmente. Calcula NA, %LINHA, %COLUNA, e os avisos de cobertura. |
 | `indices.py` | Média ponderada, tendência entre ondas e correlação ponderada entre índices (pro quadrante). Separado do motor de cruzamento porque índice não tem categoria pra cruzar, tem um número. |
-| `app.py` | Interface Streamlit -- quatro abas (Cruzamento / Comparar / Índices / Diagnóstico de dados). Banco fixo: lê sempre o `.parquet` de caminho relativo ao próprio arquivo, sem upload nem input de caminho na tela. |
+| `sql_filter.py` | Filtro SQL da aba Filtro SQL: confere a condição, roda no DuckDB com as travas de segurança e devolve quais entrevistas passaram; traduz o erro pro português. Não conhece o Streamlit. |
+| `app.py` | Interface Streamlit -- cinco abas (Cruzamento / Comparar / Índices / Diagnóstico de dados / Filtro SQL). Banco fixo: lê sempre o `.parquet` de caminho relativo ao próprio arquivo, sem upload nem input de caminho na tela. |
 | `tools/convert_to_parquet.py` | Script que roda fora do Streamlit, converte o `.xlsx` bruto pra `.parquet` otimizado. Único jeito de atualizar o banco. |
 | `tools/list_variables.py` | Audita a classificação de variáveis, gera `docs/variaveis_cruzamento.csv` pra revisão manual. |
 | `tools/make_sample.py` | Gera a amostra de `data/sample/`, estratificada por onda. |
@@ -255,7 +330,8 @@ Padrões que não são óbvios e custaram investigação contra o banco real
 
 - Regra de N/A em indicador é global (manter/excluir) na tela, não
   configurável por variável.
-- Filtro de base por variável de múltipla resposta não suportado.
+- Filtro de base por variável de múltipla resposta não suportado na barra
+  lateral; dá pra fazer pela aba Filtro SQL.
 - Quadrante "Tendência x Nível" precisa de 2+ ondas na base filtrada pra
   gerar ponto -- com filtro restringindo a uma onda só, o quadrante fica
   vazio pra esse eixo (degrada graciosamente, não quebra).

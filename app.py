@@ -27,8 +27,11 @@ ESTRUTURA DESTE ARQUIVO
 3. Aba Cruzamento -- `_render_cruzamento_tab`
 4. Aba Índices -- três visões (`_render_indices_overview/_individual/
    _quadrant`) chamadas por `_render_indices_tab`
-5. Barra lateral -- `_render_sidebar`, devolve os valores escolhidos
-6. `main()` -- amarra tudo
+5. Aba Filtro SQL -- `_render_sql_tab`, e o filtro SQL em si
+   (`_filtro_sql_atual`, aviso fixo `_render_aviso_sql`); a conta mora em
+   `sql_filter.py`
+6. Barra lateral -- `_render_sidebar`, devolve os valores escolhidos
+7. `main()` -- amarra tudo
 
 Rodar localmente:
     pixi run streamlit run app.py
@@ -58,6 +61,17 @@ from crosstab_engine import (
 )
 from indices import compute_index_trend, compute_quadrant_data, indicator_media_map
 from metadata import VarType, category_color, classify_columns, crossable_variables, load_parquet_with_labels, sort_categories
+from sql_filter import (
+    LIMITE_SEGUNDOS,
+    ErroFiltroSQL,
+    calcular_mascara,
+    colunas_citadas,
+    como_escrever,
+    limpar_condicao,
+    mensagem_sem_linhas,
+    resumo_valores,
+    sem_acento_minusculo,
+)
 
 st.set_page_config(page_title="Gerador de Banner", layout="wide")
 
@@ -471,7 +485,30 @@ def _availability_note(data: pd.DataFrame, meta: dict, stub_key: str) -> str | N
     return f"Pergunta aplicada apenas em {', '.join(years)} (não feita em {', '.join(missing)})."
 
 
-def _render_block_notes(blocks: list, availability: str | None = None) -> None:
+def _filter_note_lines(active_filters: dict, meta: dict, max_valores: int | None = None) -> list[str]:
+    """
+    Uma linha de texto por filtro ativo (SQL primeiro, depois a cascata da
+    barra lateral, na ordem em que foram aplicados). Vai pra tela, embaixo
+    do banner, e pras Notas do CSV/Excel: o arquivo circula sem a tela, e
+    sem essa linha ninguém sabe de que recorte saiu o número.
+
+    `max_valores` corta listas longas na tela (ex.: 90 cidades mantidas);
+    na exportação vai tudo (`None`).
+    """
+    linhas = []
+    for key, valores in active_filters.items():
+        if key == SQL_FILTER_KEY:
+            linhas.append(f"Filtro SQL: {valores[0]}")
+            continue
+        label = meta[key].label if key in meta else key
+        vals = [str(v) for v in valores]
+        if max_valores is not None and len(vals) > max_valores:
+            vals = vals[:max_valores] + [f"… (+{len(valores) - max_valores})"]
+        linhas.append(f"Filtro de base — {label}: manter {', '.join(vals)}")
+    return linhas
+
+
+def _render_block_notes(blocks: list, availability: str | None = None, filtros: list[str] | None = None) -> None:
     """
     Legenda de base + avisos por variável de banner, acima da tabela --
     compartilhada pela aba Cruzamento e pelos painéis do Comparar (antes
@@ -484,6 +521,8 @@ def _render_block_notes(blocks: list, availability: str | None = None) -> None:
     errada "as barras deveriam fechar 100% do ano inteiro": o ano inteiro
     inclui gente a quem a pergunta nunca foi feita.
     """
+    for linha in filtros or []:
+        st.caption(f"🔎 {linha}")
     if availability:
         st.caption(f"📅 {availability}")
     for b in blocks[1:]:
@@ -498,9 +537,10 @@ def _render_block_notes(blocks: list, availability: str | None = None) -> None:
             st.warning(f"**{b.banner_label}**: {b.coverage_warning}")
 
 
-def _export_notes(blocks: list, use_weighting: bool, availability: str | None = None) -> list[str]:
-    """Linhas de nota que vão junto do CSV/Excel -- a base de cada %LINHA, a convenção de peso e, se houver, os anos em que a pergunta foi aplicada."""
-    notes = [availability] if availability else []
+def _export_notes(blocks: list, use_weighting: bool, availability: str | None = None, filtros: list[str] | None = None) -> list[str]:
+    """Linhas de nota que vão junto do CSV/Excel -- os filtros aplicados, a base de cada %LINHA, a convenção de peso e, se houver, os anos em que a pergunta foi aplicada."""
+    notes = list(filtros or [])
+    notes += [availability] if availability else []
     notes += [f"{b.banner_label}: {describe_block_base(b)}" for b in blocks[1:]]
     notes.append("Peso amostral aplicado aos percentuais." if use_weighting else "Percentuais sem peso amostral (contagem bruta).")
     return notes
@@ -570,7 +610,7 @@ def _render_cruzamento_tab(
         mask = pd.concat([unfiltered_mask, mask], axis=1)
 
     # --- legendas de cobertura por variável de banner ---
-    _render_block_notes(blocks, _availability_note(data, meta, stub_key))
+    _render_block_notes(blocks, _availability_note(data, meta, stub_key), _filter_note_lines(active_filters, meta, max_valores=10))
 
     st.subheader(f"{options[stub_key]}")
     if use_weighting:
@@ -732,7 +772,8 @@ def _render_cruzamento_tab(
 
     _render_export_controls(
         table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix="cruzamento",
-        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key)), extra_signature=(use_weighting, use_universe),
+        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key), _filter_note_lines(active_filters, meta)),
+        extra_signature=(use_weighting, use_universe),
     )
 
 
@@ -1013,7 +1054,7 @@ def _render_comparison_panel(
     table = format_banner_table_full(blocks)
     mask = small_n_mask_full(blocks)
 
-    _render_block_notes(blocks, _availability_note(data, meta, stub_key))
+    _render_block_notes(blocks, _availability_note(data, meta, stub_key), _filter_note_lines(active_filters, meta, max_valores=10))
 
     def _highlight_small_n(_: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("", index=table.index, columns=table.columns)
@@ -1072,7 +1113,8 @@ def _render_comparison_panel(
 
     _render_export_controls(
         table, mask, stub_key, banner_keys, active_filters, na_handling, key_prefix=key_prefix,
-        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key)), extra_signature=(use_weighting, use_universe),
+        notes=_export_notes(blocks, use_weighting, _availability_note(data, meta, stub_key), _filter_note_lines(active_filters, meta)),
+        extra_signature=(use_weighting, use_universe),
     )
 
 
@@ -1206,7 +1248,7 @@ def _indices_overview_table(filtered_data, meta, indicator_names, media_map, seg
     return pd.DataFrame(rows).T
 
 
-def _render_indices_overview(filtered_data, meta, options, indicator_names, media_map, segment_key, weights) -> None:
+def _render_indices_overview(filtered_data, meta, options, indicator_names, media_map, segment_key, weights, notes: list[str] | None = None) -> None:
     """Todos os índices juntos, mesma escala 1-5 -- alternável entre linha de tendência ("painel de saúde") e tabela de médias."""
     view = st.radio("Mostrar como", ["Gráfico", "Tabela"], horizontal=True, key="indices_overview_view")
 
@@ -1215,7 +1257,7 @@ def _render_indices_overview(filtered_data, meta, options, indicator_names, medi
     with col_csv:
         st.download_button(
             "Baixar índices (CSV)",
-            data=table.to_csv().encode("utf-8"),
+            data=(table.to_csv() + ("\n" + "\n".join(['"Notas"'] + ['"' + n.replace('"', "'") + '"' for n in notes]) + "\n" if notes else "")).encode("utf-8"),
             file_name=f"indices_por_{segment_key}.csv",
             mime="text/csv",
             key="download_indices_overview_csv",
@@ -1223,7 +1265,7 @@ def _render_indices_overview(filtered_data, meta, options, indicator_names, medi
     with col_xlsx:
         st.download_button(
             "Baixar índices (Excel)",
-            data=table_to_excel_bytes(table, sheet_name="Índices", default_format="#,##0.00"),
+            data=table_to_excel_bytes(table, sheet_name="Índices", default_format="#,##0.00", notes=notes),
             file_name=f"indices_por_{segment_key}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_indices_overview_xlsx",
@@ -1380,7 +1422,7 @@ def _render_indices_quadrant(filtered_data, meta, indicator_names, media_map, se
         st.caption(f"Fora do gráfico por falta de dado suficiente: {', '.join(faltando)}")
 
 
-def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_data: pd.DataFrame) -> None:
+def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_data: pd.DataFrame, notes: list[str] | None = None) -> None:
     """
     Ponto de entrada da aba Índices: monta os controles comuns às três
     visões (segmento, seletor de visão) e despacha pra
@@ -1436,7 +1478,7 @@ def _render_indices_tab(data: pd.DataFrame, meta: dict, options: dict, filtered_
         )
 
     if view_mode == "Visão geral":
-        _render_indices_overview(filtered_data, meta, options, indicator_names, media_map, segment_key, weights)
+        _render_indices_overview(filtered_data, meta, options, indicator_names, media_map, segment_key, weights, notes)
     elif view_mode == "Índice individual":
         _render_indices_individual(filtered_data, meta, options, indicator_names, media_map, segment_key, weights)
     else:  # Quadrante
@@ -1556,8 +1598,8 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
     st.subheader("Diagnóstico de dados")
 
     usar_filtro = st.checkbox(
-        "Aplicar o filtro de base da barra lateral", value=True,
-        help="Desmarque pra diagnosticar a base completa, ignorando o filtro em '1. Filtro de base'.",
+        "Aplicar o filtro de base (barra lateral e Filtro SQL)", value=True,
+        help="Desmarque pra diagnosticar a base completa, ignorando o filtro em '1. Filtro de base' e o da aba Filtro SQL.",
     )
     base = filtered_data if usar_filtro else data
     st.caption(f"{len(base)} respondentes disponíveis nessa visão · {len(base.columns)} colunas no total.")
@@ -1620,10 +1662,292 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  FILTRO SQL
+# ══════════════════════════════════════════════════════════════════════
+# A conta (checar, rodar no DuckDB, traduzir erro) mora em `sql_filter.py`;
+# aqui fica só a orquestração: guardar a condição aplicada, cachear a
+# máscara, desenhar a aba e o aviso.
+#
+# ESTADO: a condição APLICADA fica em `st.session_state[_SQL_APLICADA]`,
+# uma chave comum (não de widget). É ela que vale pro app -- não o texto
+# da caixa, que pode estar pela metade. Por isso a barra lateral, que o
+# Streamlit desenha ANTES das abas, já enxerga o filtro: ela lê essa
+# chave no começo da rodada, e os botões Aplicar/Limpar mudam a chave
+# num callback, que roda antes do script.
+#
+# ORDEM: o SQL corta primeiro, sobre o banco inteiro; a cascata da barra
+# lateral parte do que sobrou (ver `sql_filter.py` pro porquê).
+
+SQL_FILTER_KEY = "__sql__"  # chave reservada em `active_filters`; código de coluna nunca começa com "__"
+_SQL_APLICADA = "sql_aplicada"
+_SQL_TEXTO = "sql_texto"
+_SQL_ERRO = "sql_erro"
+_SQL_ERRO_DETALHE = "sql_erro_detalhe"
+_SQL_COLUNAS = "sql_colunas"
+_SQL_COLUNAS_PADRAO = ("ID_UNICO", "ANO", "OPERACAO", "CIDADES")
+SQL_LINHAS_MAX = 1000  # decisão do Ro (25/11): de 1 a 1.000 linhas na tabela da aba, pra página não pesar
+
+_SQL_EXEMPLOS = [
+    ("Operação e anos", "OPERACAO = 'PLENA' AND ANO IN ('2024', '2025')"),
+    ("Quem marcou uma opção de múltipla escolha", '"P46.1-Outros"'),
+    ("Número: peso e média", '"P21.7_media" >= 4 AND PESO > 0.5'),
+    ("Texto parecido (sem diferenciar maiúscula)", "lower(CIDADES) LIKE '%rio%'"),
+    ("Sem resposta", "P25 IS NULL"),
+    ("Cidades PLENA presentes nos 5 anos",
+     "CIDADES IN (SELECT CIDADES FROM dados WHERE OPERACAO = 'PLENA'\n"
+     "            GROUP BY CIDADES HAVING COUNT(DISTINCT ANO) = 5)\nAND OPERACAO = 'PLENA'"),
+]
+
+
+def _fmt_int(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def _colunas_ocultas(meta: dict) -> tuple[str, ...]:
+    """Colunas retiradas do app de propósito (VarType.EXCLUDED, ex.: IMCE/IMCT): fora da tabela `dados` do SQL."""
+    return tuple(sorted(k for k, m in meta.items() if m.var_type == VarType.EXCLUDED))
+
+
+@st.cache_data(show_spinner="Rodando o filtro SQL...", max_entries=32)
+def _sql_mask_cached(data_path: str, condicao: str, colunas_ocultas: tuple, _data: pd.DataFrame):
+    """
+    Máscara da condição, cacheada pelo TEXTO da condição + caminho do banco.
+    `_data` não é hasheado (sublinhado): hashear 119 mil x 1.600 colunas a
+    cada rodada custaria mais que a própria consulta; o banco é função do
+    caminho, que já está na chave (mesma premissa de `_load_and_classify`).
+    """
+    return calcular_mascara(_data, condicao, colunas_ocultas)
+
+
+def _colunas_tabela_padrao(data: pd.DataFrame) -> list[str]:
+    return [c for c in _SQL_COLUNAS_PADRAO if c in data.columns]
+
+
+def _on_aplicar_sql(data: pd.DataFrame, meta: dict) -> None:
+    """
+    Callback do botão Aplicar. Só troca a condição aplicada se ela rodou
+    E deixou alguém na base: com zero entrevistas a barra lateral pararia
+    o app (`st.stop`) e a aba sumiria junto, sem jeito de desfazer. Em
+    qualquer falha o filtro anterior continua valendo -- o aviso no topo
+    mostra qual é.
+    """
+    st.session_state[_SQL_ERRO_DETALHE] = None
+    cond = limpar_condicao(st.session_state.get(_SQL_TEXTO))
+    if cond is None:
+        _on_limpar_sql()
+        return
+    ocultas = _colunas_ocultas(meta)
+    try:
+        mask = _sql_mask_cached(str(DATA_PATH), cond, ocultas, data)
+    except ErroFiltroSQL as exc:
+        st.session_state[_SQL_ERRO] = str(exc)
+        st.session_state[_SQL_ERRO_DETALHE] = exc.detalhe
+        return
+    except ImportError:
+        st.session_state[_SQL_ERRO] = "O DuckDB não está instalado neste ambiente: rode `pixi install` (ou `pip install duckdb`)."
+        return
+    if not mask.any():
+        st.session_state[_SQL_ERRO] = mensagem_sem_linhas(data, cond)
+        return
+    st.session_state[_SQL_APLICADA] = cond
+    st.session_state[_SQL_ERRO] = None
+    # já mostra na tabela da aba as colunas que a condição usa
+    colunas = list(st.session_state.get(_SQL_COLUNAS) or _colunas_tabela_padrao(data))
+    for c in colunas_citadas(cond, list(data.columns)):
+        if c not in colunas and c not in ocultas:
+            colunas.append(c)
+    st.session_state[_SQL_COLUNAS] = colunas
+
+
+def _on_limpar_sql() -> None:
+    """Tira o filtro SQL do app. O texto da caixa fica, pra dar pra corrigir e aplicar de novo."""
+    st.session_state[_SQL_APLICADA] = None
+    st.session_state[_SQL_ERRO] = None
+    st.session_state[_SQL_ERRO_DETALHE] = None
+
+
+def _filtro_sql_atual(data: pd.DataFrame, meta: dict):
+    """
+    (condição aplicada, máscara) -- ou (None, None) sem filtro. Se a
+    condição aplicada deixar de rodar (ex.: o banco foi trocado e a coluna
+    sumiu), o filtro sai e a aba mostra por quê, em vez de quebrar o app.
+    """
+    cond = st.session_state.get(_SQL_APLICADA)
+    if not cond:
+        return None, None
+    try:
+        mask = _sql_mask_cached(str(DATA_PATH), cond, _colunas_ocultas(meta), data)
+    except (ErroFiltroSQL, ImportError) as exc:
+        _on_limpar_sql()
+        st.session_state[_SQL_ERRO] = f"O filtro SQL que estava aplicado deixou de funcionar e foi retirado: {exc}"
+        return None, None
+    if not mask.any():
+        _on_limpar_sql()
+        st.session_state[_SQL_ERRO] = "O filtro SQL que estava aplicado não deixa mais ninguém na base e foi retirado."
+        return None, None
+    return cond, mask
+
+
+def _render_aviso_sql(cond: str, n: int, total: int) -> None:
+    """
+    Aviso fixo no topo de todas as abas enquanto houver filtro SQL. Existe
+    porque o filtro mora numa aba: sem isso, dava pra ir pro Cruzamento e
+    ler número filtrado sem lembrar do filtro. Desenhado ANTES da barra
+    lateral, pra o Limpar existir mesmo quando a cascata zera a base e o
+    app para (`st.stop`).
+    """
+    col_txt, col_btn = st.columns([5, 1], vertical_alignment="center")
+    with col_txt:
+        st.info(f"🔎 **Filtro SQL ativo** — {_fmt_int(n)} de {_fmt_int(total)} entrevistas. Vale pro app inteiro "
+                f"(aba 🔎 Filtro SQL); os filtros da barra lateral partem delas.")
+        st.code(cond, language="sql", wrap_lines=True)
+    with col_btn:
+        st.button("Limpar filtro SQL", key="sql_limpar_topo", on_click=_on_limpar_sql, width="stretch")
+
+
+def _tabela_busca_codigos(data: pd.DataFrame, meta: dict, busca: str, ocultas: tuple, limite: int = 50) -> pd.DataFrame:
+    """Código | como escrever | pergunta | tipo | valores, das colunas que casam com a busca (código ou texto da pergunta, sem acento)."""
+    tipo_legivel = {
+        VarType.SR: "texto (resposta única)",
+        VarType.INDICATOR: "texto (indicador)",
+        VarType.MR_OPTION: "verdadeiro/falso (múltipla escolha)",
+        VarType.SCALE_MEDIA: "número (média)",
+        VarType.WEIGHT: "número (peso)",
+        VarType.IDENTIFIER: "identificador",
+    }
+    # cada palavra da busca tem que aparecer (em qualquer ordem): "esgoto piorou" acha a P25
+    termos = sem_acento_minusculo(busca).split()
+    linhas = []
+    for c in data.columns:
+        if c in ocultas:
+            continue
+        label = meta[c].label if c in meta else c
+        texto = sem_acento_minusculo(c) + " " + sem_acento_minusculo(label)
+        if not all(t in texto for t in termos):
+            continue
+        linhas.append(c)
+        if len(linhas) >= limite:
+            break
+    return pd.DataFrame([
+        {
+            "código": c,
+            "como escrever": como_escrever(c),
+            "pergunta": meta[c].label if c in meta else c,
+            "tipo": tipo_legivel.get(meta[c].var_type, "") if c in meta else "",
+            "valores": resumo_valores(data[c]),
+        }
+        for c in linhas
+    ])
+
+
+def _render_sql_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame, sql_mask) -> None:
+    """
+    Aba Filtro SQL: escrever a condição, achar o código da pergunta e ver a
+    tabela. Decisões do Ro (25/11): é pra quem já sabe SQL (sem montador
+    visual), mas erro em português; tabela com colunas escolhidas e de 1 a
+    1.000 linhas; escolher se a tabela mostra a base final ou só o SQL.
+    Com a caixa vazia, o app funciona como antes.
+    """
+    st.subheader("Filtro SQL")
+    st.caption(
+        "Escreva só a **condição** (o que viria depois do WHERE). A tabela se chama `dados` e cada coluna é o "
+        "**código** da pergunta (busca logo abaixo). Texto vai entre aspas simples: `'PLENA'`; nome de coluna com "
+        "ponto, hífen ou espaço vai entre aspas duplas: `\"P29.1\"`. ANO é texto: `ANO = '2025'`. "
+        f"A condição roda sobre o banco inteiro e, ao clicar **Aplicar**, vale pro app todo. Limite: {LIMITE_SEGUNDOS} s."
+    )
+    # O widget some do session_state se o script parar antes de desenhá-lo
+    # (ex.: `st.stop` da barra lateral); a condição aplicada não some, então
+    # a caixa volta preenchida com ela.
+    if _SQL_TEXTO not in st.session_state:
+        st.session_state[_SQL_TEXTO] = st.session_state.get(_SQL_APLICADA) or ""
+    st.text_area("Condição SQL", key=_SQL_TEXTO, height=130,
+                 placeholder="OPERACAO = 'PLENA' AND ANO IN ('2024', '2025')")
+    col_a, col_l, col_status = st.columns([1, 1, 4], vertical_alignment="center")
+    with col_a:
+        st.button("Aplicar", type="primary", key="sql_aplicar", on_click=_on_aplicar_sql, args=(data, meta), width="stretch")
+    with col_l:
+        st.button("Limpar filtro", key="sql_limpar", on_click=_on_limpar_sql, width="stretch")
+    aplicada = st.session_state.get(_SQL_APLICADA)
+    with col_status:
+        if aplicada and sql_mask is not None:
+            st.success(f"Filtro ativo: {_fmt_int(int(sql_mask.sum()))} de {_fmt_int(len(data))} entrevistas.")
+        else:
+            st.caption("Sem filtro SQL: o app usa o banco inteiro (mais os filtros da barra lateral).")
+    erro = st.session_state.get(_SQL_ERRO)
+    if erro:
+        st.error(erro + (" O filtro anterior continua valendo." if aplicada else ""))
+        if st.session_state.get(_SQL_ERRO_DETALHE):
+            with st.expander("Mensagem original do DuckDB"):
+                st.code(st.session_state[_SQL_ERRO_DETALHE], language=None, wrap_lines=True)
+    if aplicada and limpar_condicao(st.session_state.get(_SQL_TEXTO)) != aplicada:
+        st.caption("✏️ O texto da caixa mudou e ainda não foi aplicado; o que vale é a condição do aviso no topo.")
+
+    with st.expander("Exemplos (copie pelo ícone no canto do código)"):
+        for titulo, exemplo in _SQL_EXEMPLOS:
+            st.markdown(f"**{titulo}**")
+            st.code(exemplo, language="sql")
+        st.caption("Múltipla escolha é verdadeiro/falso: `NOT \"P46.1-Outros\"` inclui também quem nunca recebeu a pergunta.")
+
+    ocultas = _colunas_ocultas(meta)
+    with st.expander("Procurar o código da pergunta"):
+        busca = st.text_input("Parte do código ou do texto da pergunta", key="sql_busca",
+                              placeholder="ex.: esgoto, P46.1, concessionaria")
+        tabela = _tabela_busca_codigos(data, meta, busca, ocultas)
+        if tabela.empty:
+            st.caption("Nenhuma coluna com esse texto.")
+        else:
+            st.caption("Até 50 resultados. Use a coluna **como escrever** na condição (dá pra selecionar e copiar).")
+            st.dataframe(tabela, hide_index=True, width="stretch",
+                         column_config={"pergunta": st.column_config.TextColumn(width="large")})
+
+    st.markdown("**Tabela**")
+    base_final = st.checkbox(
+        "Somar os filtros da barra lateral (base final, a que o cruzamento usa)", value=True, key="sql_base_final",
+        help="Só muda o que ESTA tabela mostra. O app usa sempre o filtro SQL e os da barra lateral juntos.",
+    )
+    if base_final:
+        base = filtered_data
+    else:
+        base = data[sql_mask] if sql_mask is not None else data
+    opcoes = [c for c in data.columns if c not in ocultas]
+    if _SQL_COLUNAS not in st.session_state:
+        st.session_state[_SQL_COLUNAS] = _colunas_tabela_padrao(data)
+    else:  # coluna que saiu do banco (troca de banco com o app aberto) derrubaria o multiselect
+        st.session_state[_SQL_COLUNAS] = [c for c in st.session_state[_SQL_COLUNAS] if c in opcoes]
+    label_por_coluna = {c: (meta[c].label if c in meta else c) for c in opcoes}
+    col_cols, col_n = st.columns([4, 1])
+    with col_cols:
+        colunas = st.multiselect(
+            "Colunas", options=opcoes, key=_SQL_COLUNAS,
+            format_func=lambda c: f"{c} — {label_por_coluna[c]}" if label_por_coluna[c] != c else c,
+            help="Digite pra buscar por código ou pelo texto da pergunta.",
+        )
+    with col_n:
+        n_linhas = st.number_input("Linhas", min_value=1, max_value=SQL_LINHAS_MAX, value=SQL_LINHAS_MAX, step=50, key="sql_n_linhas")
+    if not colunas:
+        st.info("Escolha ao menos uma coluna.")
+        return
+    st.caption(f"Mostrando {_fmt_int(min(int(n_linhas), len(base)))} de {_fmt_int(len(base))} entrevistas "
+               f"({'base final' if base_final else 'só o filtro SQL'}). Passe o mouse no nome da coluna pra ver a pergunta.")
+    st.dataframe(
+        base[colunas].head(int(n_linhas)),
+        hide_index=True,
+        width="stretch",
+        column_config={c: st.column_config.Column(c, help=label_por_coluna[c]) for c in colunas},
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  BARRA LATERAL
 # ══════════════════════════════════════════════════════════════════════
 
-def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.DataFrame, str, list[str], str, int, dict, bool, bool, dict]:
+def _render_sidebar(
+    data: pd.DataFrame,
+    meta: dict,
+    options: dict,
+    sql_condition: str | None = None,
+    sql_base: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, str, list[str], str, int, dict, bool, bool, dict]:
     """
     Monta a barra lateral inteira (filtro de base, seleção de stub/
     banner, regras) e já aplica o filtro escolhido, devolvendo tudo que
@@ -1643,9 +1967,20 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
     O filtro de base é aplicado ANTES de qualquer cruzamento -- é só um
     recorte de linhas do df. Nada em `crosstab_engine.py` precisa saber
     que um filtro existe; ele só vê um df menor.
+
+    Filtro SQL (aba Filtro SQL): quando existe, `sql_base` é o banco já
+    cortado por ele e a cascata parte dali -- o SQL é o primeiro filtro.
+    Ele entra em `active_filters` com a chave reservada `SQL_FILTER_KEY`,
+    e por isso vale em tudo que já usa `active_filters`: a assinatura do
+    cache de variáveis visíveis, a da exportação, a coluna "Total geral
+    (sem filtro)" e as notas.
     """
     with st.sidebar:
         st.header("1. Filtro de base (opcional)")
+        if sql_condition:
+            st.caption(f"🔎 **Filtro SQL ativo**: {_fmt_int(len(sql_base))} de {_fmt_int(len(data))} entrevistas "
+                       f"(aba 🔎 Filtro SQL). Os filtros abaixo partem delas.")
+            st.button("Limpar filtro SQL", key="sql_limpar_lateral", on_click=_on_limpar_sql)
         filter_keys = st.multiselect(
             "Restringir a base a...",
             options=list(options.keys()),
@@ -1662,8 +1997,9 @@ def _render_sidebar(data: pd.DataFrame, meta: dict, options: dict) -> tuple[pd.D
                 "sobraram do filtro anterior, na ordem em que aparecem aqui."
             )
 
-        active_filters: dict[str, list[str]] = {}
-        cascading_data = data  # encolhe a cada iteração -- é o que faz a cascata funcionar
+        active_filters: dict[str, list[str]] = {SQL_FILTER_KEY: [sql_condition]} if sql_condition else {}
+        # encolhe a cada iteração -- é o que faz a cascata funcionar; com filtro SQL, já começa cortado por ele
+        cascading_data = sql_base if (sql_condition and sql_base is not None) else data
         for fk in filter_keys:
             fmeta = meta.get(fk)
             if fmeta is None or fmeta.var_type not in (VarType.SR, VarType.INDICATOR):
@@ -1844,10 +2180,16 @@ def main() -> None:
         f"({n_mr} são blocos de múltipla resposta, unpivotados automaticamente)."
     )
 
+    # Filtro SQL: primeiro corte, antes da barra lateral (ver seção FILTRO SQL).
+    sql_condition, sql_mask = _filtro_sql_atual(data, meta)
+    sql_base = data[sql_mask] if sql_mask is not None else None
+    if sql_condition:
+        _render_aviso_sql(sql_condition, int(sql_mask.sum()), len(data))
+
     (
         filtered_data, stub_key, banner_keys, na_handling, small_n_threshold,
         active_filters, use_weighting, use_universe, visible_options,
-    ) = _render_sidebar(data, meta, options)
+    ) = _render_sidebar(data, meta, options, sql_condition, sql_base)
 
     # Aviso de peso: logo abaixo do cabeçalho, vale para todas as abas.
     if use_weighting:
@@ -1858,17 +2200,25 @@ def main() -> None:
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
 
-    tab_cruzamento, tab_comparacao, tab_indices, tab_dados = st.tabs(
-        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "🩺 Diagnóstico de dados"]
+    # "Filtro SQL" é a ÚLTIMA aba de propósito: o Streamlit abre na primeira,
+    # então o app continua abrindo no Cruzamento, como antes.
+    # `key` fixa a identidade das abas: sem ele, o aviso do filtro SQL que
+    # aparece/some ACIMA das abas mudava a posição delas na página, e o
+    # Streamlit voltava pra primeira aba a cada Aplicar/Limpar (visto no teste).
+    tab_cruzamento, tab_comparacao, tab_indices, tab_dados, tab_sql = st.tabs(
+        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "🩺 Diagnóstico de dados", "🔎 Filtro SQL"],
+        key="abas_principais",
     )
     with tab_cruzamento:
         _render_cruzamento_tab(data, meta, visible_options, filtered_data, stub_key, banner_keys, na_handling, small_n_threshold, active_filters, use_weighting, use_universe)
     with tab_comparacao:
         _render_comparacao_tab(data, meta, visible_options, filtered_data, na_handling, small_n_threshold, active_filters, use_weighting, use_universe)
     with tab_indices:
-        _render_indices_tab(data, meta, visible_options, filtered_data)
+        _render_indices_tab(data, meta, visible_options, filtered_data, _filter_note_lines(active_filters, meta))
     with tab_dados:
         _render_dados_tab(data, meta, filtered_data)
+    with tab_sql:
+        _render_sql_tab(data, meta, filtered_data, sql_mask)
 
 
 if __name__ == "__main__":

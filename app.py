@@ -104,16 +104,28 @@ DATA_PATH = Path(os.environ.get(
 #  CARREGAMENTO
 # ══════════════════════════════════════════════════════════════════════
 
-@st.cache_data(show_spinner="Carregando o banco...")
+@st.cache_resource(show_spinner="Carregando o banco...")
 def _load_and_classify(path: str) -> tuple[pd.DataFrame, dict]:
     """
-    Lê o parquet e classifica as colunas -- cacheado pelo Streamlit
-    (`@st.cache_data`) porque, sem isso, QUALQUER interação (trocar o
-    limiar de N pequeno, mudar um seletor) rerodaria o app inteiro e
-    reclassificaria as 1164 colunas do zero a cada clique. O cache é
-    invalidado automaticamente se `path` mudar.
+    Lê o parquet e classifica as colunas -- cacheado pelo Streamlit porque,
+    sem isso, QUALQUER interação (trocar o limiar de N pequeno, mudar um
+    seletor) rerodaria o app inteiro e reclassificaria as colunas do zero
+    a cada clique. O cache é invalidado automaticamente se `path` mudar.
+
+    POR QUE `cache_resource` E NÃO `cache_data`: `cache_data` entrega uma
+    CÓPIA do banco (~334 MB) pra cada sessão, a cada rodada; com 4 abas
+    abertas o app chegava a ~2 GB, perto do teto do Community Cloud.
+    `cache_resource` entrega o MESMO objeto pra todo mundo (medido em
+    27/11/2026: 4 sessões de 2.066 MB para 745 MB).
+
+    ⚠️  BANCO COMPARTILHADO: NUNCA escrever nele -- nada de
+    `data[col] = ...`, `.loc[...] = ...`, `inplace=True`, `data.columns = ...`
+    em cima do que esta função devolve (nem em `filtered_data` sem filtro,
+    que é o mesmo objeto). A mudança valeria pra TODOS os usuários ao
+    mesmo tempo, sem aviso. Pra alterar, crie uma tabela nova antes
+    (`df = data[cols].copy()`) ou monte uma Series à parte (ex.: pesos).
     """
-    data, full_labels, short_names = load_parquet_with_labels(path)
+    data, full_labels, short_names = load_parquet_with_labels(path, enxuto=True)  # menos memória, ver metadata.py
     meta = classify_columns(data, full_labels, short_names)
     return data, meta
 
@@ -2211,14 +2223,19 @@ def _sql_mask_cached(data_path: str, condicao: str, colunas_ocultas: tuple, _dat
     return calcular_mascara(_data, condicao, colunas_ocultas)
 
 
-def _on_aplicar_sql(data: pd.DataFrame, meta: dict) -> None:
+def _on_aplicar_sql() -> None:
     """
     Callback do botão Aplicar. Só troca a condição aplicada se ela rodou
     E deixou alguém na base: com zero entrevistas a barra lateral pararia
     o app (`st.stop`) e a aba sumiria junto, sem jeito de desfazer. Em
     qualquer falha o filtro anterior continua valendo -- o aviso no topo
     mostra qual é.
+
+    Busca o banco no cache AQUI, em vez de recebê-lo por `args=` no botão:
+    o Streamlit guarda os `args` de cada widget enquanto a sessão vive, e
+    isso segurava uma cópia do banco por aba aberta (ver `_load_and_classify`).
     """
+    data, meta = _load_and_classify(str(DATA_PATH))
     st.session_state[_SQL_ERRO_DETALHE] = None
     cond = limpar_condicao(st.session_state.get(_SQL_TEXTO))
     if cond is None:
@@ -2347,7 +2364,7 @@ def _render_sql_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame,
                  placeholder="OPERACAO = 'PLENA' AND ANO IN ('2024', '2025')")
     col_a, col_l, col_status = st.columns([1, 1, 4], vertical_alignment="center")
     with col_a:
-        st.button("Aplicar", type="primary", key="sql_aplicar", on_click=_on_aplicar_sql, args=(data, meta), width="stretch")
+        st.button("Aplicar", type="primary", key="sql_aplicar", on_click=_on_aplicar_sql, width="stretch")
     with col_l:
         st.button("Limpar filtro", key="sql_limpar", on_click=_on_limpar_sql, width="stretch")
     aplicada = st.session_state.get(_SQL_APLICADA)

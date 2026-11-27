@@ -60,7 +60,6 @@ class VarType(str, Enum):
     INDICATOR = "indicator"         # indicador pré-categorizado, com N/A textual possível
     IDENTIFIER = "identifier"       # ID -- não deve entrar como variável cruzável de conteúdo
     WEIGHT = "weight"                # coluna de peso amostral
-    EXCLUDED = "excluded"           # coluna que existe no banco mas foi retirada do app de propósito
 
 
 @dataclass
@@ -85,17 +84,10 @@ class VariableMeta:
 # Nomes de colunas que identificam o respondente ou carregam peso amostral
 # -- nunca devem aparecer como opção de cruzamento de conteúdo no filtro da
 # UI. Ajustar aqui se um banco novo usar nomes diferentes pra ID/peso.
-# "ID_UNICO" (banco 2026) tem uma categoria por linha -- como SR, entrava no
-# seletor de cruzamento com ~119 mil categorias e travava a tela.
+# ID_UNICO = ANO_OPERAÇÃO_CIDADE_ID, criado pelo aplicar_mapa.py (ETL de
+# 2026). Sem ele aqui, o ID de cada pessoa aparecia na caixa de cruzamento.
 _IDENTIFIER_NAMES = {"ID", "ID_UNICO"}
 _WEIGHT_NAMES = {"PESO", "WEIGHT", "PESO_AMOSTRAL"}
-
-# Colunas que existem no banco mas não devem aparecer em nenhum lugar do
-# app (decisão do Ro, 16/11/2026): IMCE e IMCT (N26_033 / N26_035) -- índices
-# de confiança em coleta/tratamento de esgoto, que não serão usados. Lista
-# explícita (e não regra por padrão) porque é decisão de negócio, não
-# propriedade do dado: se voltarem a ser usados, basta tirar daqui.
-_EXCLUDED_NAMES = {"N26_033", "N26_035"}
 
 # "código-opção": code = tudo antes do primeiro "-", option = o resto.
 # Não-guloso (.+?) pra parar no PRIMEIRO "-", já que o texto da opção
@@ -170,11 +162,7 @@ def load_raw_with_double_header(path: str, sheet_name: str = 0) -> tuple[pd.Data
     return data, full_labels, short_names
 
 
-def load_parquet_with_labels(
-    parquet_path: str,
-    labels_path: str | None = None,
-    enxuto: bool = False,
-) -> tuple[pd.DataFrame, list[str], list[str]]:
+def load_parquet_with_labels(parquet_path: str, labels_path: str | None = None) -> tuple[pd.DataFrame, list[str], list[str]]:
     """
     Contraparte de `load_raw_with_double_header`, lendo o resultado de
     `convert_to_parquet.py`. Existe pra manter `classify_columns` (e todo o
@@ -186,70 +174,14 @@ def load_parquet_with_labels(
     conversor) guarda `full_labels`/`short_names` separadamente. Se
     `labels_path` não for informado, assume o mesmo nome base do parquet
     com sufixo `.labels.json`.
-
-    `enxuto=True` (usado pelo app): lê ocupando menos memória -- ver
-    `_read_parquet_enxuto`. Desligado por padrão pra os scripts de `tools/`
-    continuarem lendo o banco exatamente como está no disco.
     """
     parquet_path_obj = Path(parquet_path)
     labels_path_obj = Path(labels_path) if labels_path else parquet_path_obj.with_suffix("").with_suffix(".labels.json")
 
-    data = _read_parquet_enxuto(parquet_path_obj) if enxuto else pd.read_parquet(parquet_path_obj)
+    data = pd.read_parquet(parquet_path_obj)
     with open(labels_path_obj, "r", encoding="utf-8") as f:
         saved = json.load(f)
     return data, saved["full_labels"], saved["short_names"]
-
-
-def _read_parquet_enxuto(parquet_path: Path) -> pd.DataFrame:
-    """
-    Lê o parquet gastando menos memória, em dois passos (medido em
-    27/11/2026 no banco 2026: o processo ia de ~690 para ~350 MB):
-
-    1. Números float64 viram float32 AINDA NO ARROW, antes de virar pandas:
-       metade da memória nessas colunas (149 -> 74 MB). float32 guarda ~7
-       dígitos, folga enorme pra nota de 1 a 5 -- os 15 índices dão o
-       mesmo número (maior diferença 1e-8). Peso (`_WEIGHT_NAMES`) fica
-       float64: entra em toda conta ponderada. Converter DEPOIS, já em
-       pandas, piorava a memória do processo (deixa buracos na memória).
-    2. Devolve ao sistema a memória que o leitor usou e não precisa mais
-       (`_devolver_memoria_livre`) -- era a maior parte do desperdício,
-       ~290 MB parados depois de abrir o banco.
-    """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    table = pq.read_table(parquet_path)
-    schema = pa.schema(
-        [
-            f.with_type(pa.float32()) if pa.types.is_float64(f.type) and f.name.upper() not in _WEIGHT_NAMES else f
-            for f in table.schema
-        ],
-        metadata=table.schema.metadata,  # guarda o que o pandas precisa (categorias, índice)
-    )
-    data = table.cast(schema).to_pandas()
-    del table, schema
-    _devolver_memoria_livre()
-    return data
-
-
-def _devolver_memoria_livre() -> None:
-    """
-    O pyarrow e o Python guardam memória já usada "de reserva" em vez de
-    devolver ao sistema. Num servidor com teto de memória (Community Cloud),
-    essa reserva conta como se estivesse em uso. Aqui pedimos de volta.
-    `malloc_trim` só existe no Linux (glibc); em outro sistema, só pula.
-    """
-    import ctypes
-    import gc
-
-    import pyarrow as pa
-
-    gc.collect()
-    pa.default_memory_pool().release_unused()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -324,24 +256,11 @@ def classify_columns(
         if m:
             code_counts[m.group("code")] = code_counts.get(m.group("code"), 0) + 1
 
-    # Bases que têm companion "_media" no banco -- usado pra decidir se uma
-    # coluna com rótulo "..._c" é de fato um índice (ver o bloco INDICATOR
-    # abaixo). Calculado numa passada própria porque a coluna "_media" pode
-    # vir DEPOIS da "_c" na ordem do banco.
-    media_bases = {
-        mm.group("base")
-        for mm in (_MEDIA_PATTERN.match(n) for n in short_names)
-        if mm is not None
-    }
-
     meta: dict[str, VariableMeta] = {}
 
     for name in short_names:
         label = label_by_name[name]
 
-        if name in _EXCLUDED_NAMES:
-            meta[name] = VariableMeta(name, label, VarType.EXCLUDED)
-            continue
         if name in _IDENTIFIER_NAMES:
             meta[name] = VariableMeta(name, label, VarType.IDENTIFIER)
             continue
@@ -385,13 +304,7 @@ def classify_columns(
             )
             continue
 
-        # Índice de verdade = rótulo "_c" E companion "<nome>_media" no banco
-        # (é assim que `indices.indicator_media_map` pareia). Só o sufixo "_c"
-        # não basta: no banco 2026, "N26_004. CLASSE_c" (A/B1/B2/C1/C2/DE) tem
-        # o mesmo sufixo mas é demografia -- sem a checagem ela cairia na aba
-        # Índices tentando virar média de 1 a 5. Sem companion, vira SR
-        # (continua cruzável como qualquer categórica).
-        if _INDICATOR_LABEL_PATTERN.search(label.strip()) and name in media_bases:
+        if _INDICATOR_LABEL_PATTERN.search(label.strip()):
             col = data[name]
             if isinstance(col, pd.DataFrame):  # nome duplicado não desambiguado antes de chegar aqui
                 col = col.iloc[:, 0]
@@ -463,7 +376,7 @@ def crossable_variables(meta: dict[str, VariableMeta]) -> list[dict]:
     seen_mr: set[str] = set()
 
     for m in meta.values():
-        if m.var_type in (VarType.IDENTIFIER, VarType.WEIGHT, VarType.SCALE_MEDIA, VarType.EXCLUDED):
+        if m.var_type in (VarType.IDENTIFIER, VarType.WEIGHT, VarType.SCALE_MEDIA):
             continue
         if m.var_type == VarType.MR_OPTION:
             if m.mr_group in seen_mr:
@@ -538,7 +451,27 @@ _SCALE_RANK: dict[str, int] = {
     "CONCORDO PARCIALMENTE": 1,
     "NEM CONCORDO, NEM DISCORDO": 2,
     "DISCORDO UM POUCO": 3,
+    "DISCORDO PARCIALMENTE": 3,
     "DISCORDO TOTALMENTE": 4,
+    "NEM CONCORDO / NEM DISCORDO": 2,
+    # Satisfação: Totalmente satisfeito -> Totalmente insatisfeito
+    "TOTALMENTE SATISFEITO": 0,
+    "SATISFEITO": 1,
+    "NEM SATISFEITO / NEM INSATISFEITO": 2,
+    "INSATISFEITO": 3,
+    "TOTALMENTE INSATISFEITO": 4,
+    # Escala agrupada em 3 pontos (colunas _box, e o IAG depois do
+    # corrigir_consistencia.py). O agrupado de cima ganha a posição 0 e o de
+    # baixo a 4 -- não 0,5 ou 3,5 -- pra pegar as cores dos extremos (verde
+    # escuro / vermelho), com o meio da escala (posição 2) em amarelo.
+    "ÓTIMO/BOM": 0,
+    "RUIM/PÉSSIMO": 4,
+    "CONCORDO TOTALMENTE/CONCORDO PARCIALMENTE": 0,
+    "DISCORDO PARCIALMENTE/DISCORDO TOTALMENTE": 4,
+    "CONFIO TOTALMENTE/CONFIO UM POUCO": 0,
+    "DESCONFIO UM POUCO/DESCONFIO TOTALMENTE": 4,
+    "TOTALMENTE SATISFEITO/SATISFEITO": 0,
+    "TOTALMENTE INSATISFEITO / INSATISFEITO": 4,
 }
 
 # Prefixo (já maiúsculo) que marca categoria residual -- sempre por

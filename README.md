@@ -20,7 +20,8 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 - [Como fazer deploy](#como-fazer-deploy)
 - [Estatística](#estatística)
 - [Índices: duas variáveis](#índices-duas-variáveis)
-- [Filtro SQL](#filtro-sql)
+- [Banco: filtro SQL e visão da base](#banco-filtro-sql-e-visão-da-base)
+- [Diagnóstico do banco (fora do app)](#diagnóstico-do-banco-fora-do-app)
 - [Arquitetura](#arquitetura)
 - [Convenções de dado descobertas](#convenções-de-dado-descobertas)
 - [Convenções estatísticas](#convenções-estatísticas)
@@ -35,7 +36,9 @@ ondas de 2022 a 2026 (`ANO`), com 1629 colunas.
 app.py, metadata.py,        código do app -- fica na raiz porque o Streamlit
 crosstab_engine.py,         Cloud exige `app.py` na raiz (Main file path) e
 indices.py, sql_filter.py,  os módulos se importam entre si pelo nome
-stats_engine.py
+stats_engine.py,
+diagnostico.py,             (diagnóstico: fora do app por enquanto)
+regras_diagnostico.py
 requirements.txt            o que o Streamlit Cloud lê pra montar o ambiente
 pixi.toml / pixi.lock       ambiente local
 data/
@@ -234,11 +237,21 @@ colunas são a variável de "Segmentar por"; as linhas, a que você escolher
   cobertura de cada combinação, com os filtros nas Notas.
 - O Total de cada ano muda conforme as cidades que entraram naquele ano.
   Pra comparar ano contra ano sem esse efeito, use antes o filtro SQL das
-  cidades presentes em todos os anos (exemplo pronto na aba Filtro SQL).
+  cidades presentes em todos os anos (exemplo pronto na aba 🔎 Banco).
 
-## Filtro SQL
+## Banco: filtro SQL e visão da base
 
-Aba **🔎 Filtro SQL** (a última). Serve pra recorte que a barra lateral não
+Aba **🔎 Banco: filtro e visão** (a última). É o lugar pra filtro complexo
+e pra **olhar o banco por dentro** -- ver quem está na base que o app está
+usando:
+
+1. **Filtro SQL** (em cima): recorte que a barra lateral não faz.
+2. **A base agora** (embaixo): as entrevistas que sobraram depois do SQL e
+   dos filtros da barra lateral -- quantas, onde estão, quais são.
+
+### Filtro SQL
+
+Serve pra recorte que a barra lateral não
 faz: OR, número (`PESO > 1.5`), múltipla escolha, e condição que depende
 de outras linhas ("cidades presentes nos 5 anos"). É pra quem já sabe SQL.
 
@@ -289,16 +302,6 @@ AND OPERACAO = 'PLENA'
 - A condição e os filtros da barra lateral vão escritos **embaixo do
   banner** e nas **Notas** do CSV/Excel (banner e índices).
 
-**A tabela da aba**
-
-- Colunas escolhidas por você (já vêm ID_UNICO, ANO, OPERACAO, CIDADES e as
-  colunas que a condição usa). Passe o mouse no nome da coluna pra ver a
-  pergunta.
-- De 1 a 1.000 linhas, pra página não pesar.
-- A caixinha "Somar os filtros da barra lateral" escolhe entre a base
-  final (o que o cruzamento usa) e só o resultado do SQL. Ela muda só a
-  tabela, não o filtro do app.
-
 **Proteções** (detalhe em `sql_filter.py`): sem acesso a arquivo,
 internet ou configuração; a única tabela visível é `dados`; limite de
 memória e de 10 s por condição; condição que não deixa ninguém na base
@@ -307,6 +310,42 @@ tabela `dados`. Erro aparece em português; a mensagem original do DuckDB
 fica num campo que abre e fecha, pra quem quiser conferir.
 
 **Dependência:** `duckdb` (testado com 1.5.3 e 2.0.1).
+
+### A base agora
+
+- **Quantas**: entrevistas na base, em **contagem sem peso** (é pra
+  enxergar o banco, não pra estimar -- não bate com o % do banner, e não
+  deve). Embaixo, a lista de filtros que está valendo.
+- **Só quem entrou no cruzamento**: chave opcional. Ligada, fica só quem
+  respondeu o stub escolhido na barra lateral -- o número bate com o
+  "Base Amostra NA" da coluna Total do banner (conferido: P25, 70.953).
+  Em stub de múltipla escolha não bate de propósito: lá o NA soma menções,
+  aqui são pessoas.
+- **Contar por** (onde estão): contagem por ANO, OPERACAO e CIDADES; dá pra
+  trocar ou somar colunas (até 6). Mostra os 15 maiores valores de cada.
+- **Colunas**: já vêm ID_UNICO, ANO, OPERACAO, CIDADES, as colunas que a
+  condição SQL usa, as dos filtros da barra lateral, o stub e o banner
+  (stub de múltipla escolha = uma coluna por opção). Dá pra adicionar
+  qualquer coluna do banco ou tirar. Ao trocar stub, banner ou filtro, as
+  colunas deles entram sozinhas; o que você adicionou ou tirou à mão fica.
+- **Ver as linhas**: até 2.000 na tela; o CSV leva todas.
+- **Resumo das colunas**: nulos, distribuição (contagem bruta) e
+  `describe()` das colunas escolhidas.
+
+## Diagnóstico do banco (fora do app)
+
+`diagnostico.py` e `regras_diagnostico.py` varrem o banco atrás de
+inconsistência (regras que deveriam dar zero linhas, texto × média,
+preenchimento por ano, colunas idênticas ou partidas entre anos,
+duplicadas na chave). Ficaram **fora do app** desde 27/11: achar erro no
+banco é trabalho do ETL, e o app é pra analisar. O plano é rodar como
+ferramenta separada (script ou app próprio) -- ainda não existe. As
+funções seguem testadas em `tests/test_diagnostico.py`.
+
+**Como criar uma regra nova**: acrescente um item em
+`regras_diagnostico.py`, com `nome`, `condicao` (SQL, mesma escrita do
+filtro) e `explicacao`. A condição descreve o **erro** (o que deveria dar
+zero linhas).
 
 ## Arquitetura
 
@@ -317,6 +356,7 @@ metadata.py            classifica cada coluna (SR/MR/indicador/peso/...)
         ├──> indices.py             tendência/quadrante dos índices
 sql_filter.py          filtro SQL (DuckDB): condição -> máscara de linhas
 stats_engine.py        estatística descritiva ponderada (aba Estatística)
+diagnostico.py         diagnóstico do banco (fora do app); regras em regras_diagnostico.py
         │
 tools/convert_to_parquet.py   script offline: xlsx -> parquet otimizado
 tools/list_variables.py       script offline: audita a classificação
@@ -330,9 +370,11 @@ app.py                  interface Streamlit (só orquestra, não calcula)
 | `metadata.py` | Lê o cabeçalho duplo do Excel e classifica cada coluna: resposta única (SR), múltipla resposta (MR), indicador pré-categorizado, ou companion numérico (`_media`). Todo o resto do projeto depende do dicionário `dict[str, VariableMeta]` que esse módulo produz. |
 | `crosstab_engine.py` | Motor de cruzamento ponderado. Normaliza qualquer variável (SR ou MR) pro mesmo formato longo (`resp_id \| category \| weight`) antes de cruzar -- é isso que elimina a necessidade de pivotar múltipla resposta manualmente. Calcula NA, %LINHA, %COLUNA, e os avisos de cobertura. |
 | `indices.py` | Média ponderada, tendência entre ondas e correlação ponderada entre índices (pro quadrante). Separado do motor de cruzamento porque índice não tem categoria pra cruzar, tem um número. |
-| `sql_filter.py` | Filtro SQL da aba Filtro SQL: confere a condição, roda no DuckDB com as travas de segurança e devolve quais entrevistas passaram; traduz o erro pro português. Não conhece o Streamlit. |
+| `sql_filter.py` | Filtro SQL da aba 🔎 Banco: confere a condição, roda no DuckDB com as travas de segurança e devolve quais entrevistas passaram; traduz o erro pro português. Não conhece o Streamlit. |
 | `stats_engine.py` | Estatística descritiva ponderada das numéricas (média, erro padrão, IC, quantis, moda...) e os números dos gráficos (distribuição, histograma, box plot). Não conhece o Streamlit; testado em `tests/`. |
-| `app.py` | Interface Streamlit -- seis abas (Cruzamento / Comparar / Índices / Estatística / Filtro SQL / Diagnóstico de dados). Banco fixo: lê sempre o `.parquet` de caminho relativo ao próprio arquivo, sem upload nem input de caminho na tela. |
+| `diagnostico.py` | Funções do diagnóstico (preenchimento por ano, texto × média, colunas idênticas/complementares, duplicadas na chave, onde está). **Não é chamado pelo app** (ver Diagnóstico do banco). Recebe DataFrame, devolve DataFrame; não conhece o Streamlit; testado em `tests/test_diagnostico.py`. |
+| `regras_diagnostico.py` | Lista das regras de consistência (condições SQL que deveriam dar zero linhas). É aqui que se cria regra nova. |
+| `app.py` | Interface Streamlit -- cinco abas (Cruzamento / Comparar / Índices / Estatística / Banco: filtro e visão). Banco fixo: lê sempre o `.parquet` de caminho relativo ao próprio arquivo, sem upload nem input de caminho na tela. |
 | `tools/convert_to_parquet.py` | Script que roda fora do Streamlit, converte o `.xlsx` bruto pra `.parquet` otimizado. Único jeito de atualizar o banco. |
 | `tools/list_variables.py` | Audita a classificação de variáveis, gera `docs/variaveis_cruzamento.csv` pra revisão manual. |
 | `tools/make_sample.py` | Gera a amostra de `data/sample/`, estratificada por onda. |
@@ -419,7 +461,7 @@ Padrões que não são óbvios e custaram investigação contra o banco real
 - Regra de N/A em indicador é global (manter/excluir) na tela, não
   configurável por variável.
 - Filtro de base por variável de múltipla resposta não suportado na barra
-  lateral; dá pra fazer pela aba Filtro SQL.
+  lateral; dá pra fazer pelo Filtro SQL da aba 🔎 Banco.
 - Quadrante "Tendência x Nível" precisa de 2+ ondas na base filtrada pra
   gerar ponto -- com filtro restringindo a uma onda só, o quadrante fica
   vazio pra esse eixo (degrada graciosamente, não quebra).
@@ -429,8 +471,8 @@ Padrões que não são óbvios e custaram investigação contra o banco real
 ## Backlog (fases futuras)
 
 - Box plot das variáveis que compõem um índice.
-- Mais testes automatizados: `tests/` já cobre `stats_engine.py` e o índice
-  de multiplicidade; falta o resto do `crosstab_engine.py` e o `metadata.py`
+- Mais testes automatizados: `tests/` já cobre `stats_engine.py`, o índice
+  de multiplicidade e `diagnostico.py`; falta o resto do `crosstab_engine.py` e o `metadata.py`
   (começando pelas perguntas de múltipla resposta).
 - Clusterizar assuntos/variáveis e visualizar força de ligação com
   grafos -- usar correlação (Pearson pra contínua, Spearman pra ordinal,

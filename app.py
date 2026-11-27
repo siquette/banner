@@ -29,9 +29,9 @@ ESTRUTURA DESTE ARQUIVO
    _quadrant`) chamadas por `_render_indices_tab`
 5. Aba Estatística -- `_render_estatistica_tab` (descritivas das
    numéricas; a conta mora em `stats_engine.py`)
-6. Aba Filtro SQL -- `_render_sql_tab`, e o filtro SQL em si
-   (`_filtro_sql_atual`, aviso fixo `_render_aviso_sql`); a conta mora em
-   `sql_filter.py`
+6. Aba Banco (filtro SQL + visão da base) -- `_render_banco_tab`; o
+   filtro em si (`_filtro_sql_atual`, aviso fixo `_render_aviso_sql`, a
+   conta mora em `sql_filter.py`) e a visão da base (`_render_base_atual`)
 7. Barra lateral -- `_render_sidebar`, devolve os valores escolhidos
 8. `main()` -- amarra tudo
 
@@ -55,6 +55,7 @@ from crosstab_engine import (
     banner_table_to_excel_bytes,
     build_banner,
     describe_block_base,
+    eligible_respondents,
     format_banner_table_full,
     format_table_for_export,
     get_column_series,
@@ -1554,7 +1555,7 @@ def _render_indices_cross(
     st.caption(
         "💡 O Total de cada coluna muda conforme as linhas que existem naquela coluna (ex.: cidades que entraram "
         "ou saíram num ano). Pra comparar ano contra ano sem esse efeito, aplique antes o filtro SQL das cidades "
-        "presentes em todos os anos (está nos exemplos da aba 🔎 Filtro SQL)."
+        "presentes em todos os anos (está nos exemplos da aba 🔎 Banco)."
     )
 
     view = st.radio("Mostrar como", ["Gráfico", "Tabela"], horizontal=True, key="indices_cross_view")
@@ -1731,7 +1732,12 @@ _INDICATOR_BIN_LABELS = [
 
 def _categorical_counts(series: pd.Series) -> pd.Series:
     """Contagem bruta por categoria, ordenada pra leitura (não alfabética), com nulo como mais uma linha."""
-    counts = series.value_counts(dropna=True)
+    if pd.api.types.is_bool_dtype(series):
+        # Opção de múltipla escolha no parquet otimizado é booleana; sem isso,
+        # a ordenação de categorias (que espera texto) quebrava.
+        series = series.map({True: "marcou", False: "não marcou"})
+    counts = series.astype("string").value_counts(dropna=True)
+    counts.index = counts.index.astype(str)
     counts = counts.reindex(sort_categories(list(counts.index)))
     counts["(nulo)"] = int(series.isna().sum())
     return counts
@@ -1754,40 +1760,15 @@ def _binned_media_counts(series: pd.Series) -> pd.Series:
     return counts
 
 
-def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame) -> None:
+def _render_resumo_colunas(base: pd.DataFrame, meta: dict, colunas: list[str]) -> None:
     """
-    Aba de DIAGNÓSTICO de dados brutos -- não é visualização, é "como
-    estão os dados": nulo por coluna, linha duplicada, describe. Existe
-    pra achar problema tipo o do ISDE (companion `_media` vazio apesar
-    da categórica ter valor real) direto na tela, sem sair do app pra
-    rodar script. Temporária de propósito -- por isso sem estilo, só a
-    conta.
-
-    Não usa `crossable_variables`/`options` pelo mesmo motivo da versão
-    anterior desta aba: aquela lista some com WEIGHT/IDENTIFIER/
-    SCALE_MEDIA, e é justamente o companion `_media` que mais precisa
-    ser diagnosticado.
+    Nulos, distribuição (contagem bruta) e describe() das colunas
+    escolhidas na visão da base (aba 🔎 Banco). Era a antiga aba
+    Diagnóstico; desde 27/11 recebe as colunas da visão em vez de ter
+    seleção própria: com 119 mil linhas, olhar linha por linha não mostra
+    padrão -- o resumo mostra.
     """
-    st.subheader("Diagnóstico de dados")
-
-    usar_filtro = st.checkbox(
-        "Aplicar o filtro de base (barra lateral e Filtro SQL)", value=True,
-        help="Desmarque pra diagnosticar a base completa, ignorando o filtro em '1. Filtro de base' e o da aba Filtro SQL.",
-    )
-    base = filtered_data if usar_filtro else data
-    st.caption(f"{len(base)} respondentes disponíveis nessa visão · {len(base.columns)} colunas no total.")
-
-    label_por_coluna = {c: (meta[c].label if c in meta else c) for c in base.columns}
-    colunas = st.multiselect(
-        "Colunas pra diagnosticar",
-        options=list(base.columns),
-        format_func=lambda c: f"{c} — {label_por_coluna[c]}" if label_por_coluna[c] != c else c,
-        help="Digite pra buscar por código (ex.: ISDE_media) ou por texto da pergunta.",
-    )
-    if not colunas:
-        st.info("Escolha ao menos uma coluna acima -- ex.: uma categórica (`ISDE`) e sua `_media` companion juntas, pra comparar direto.")
-        return
-
+    label_por_coluna = {c: (meta[c].label if c in meta else c) for c in colunas}
     subset = base[colunas]
 
     st.markdown("**Nulos por coluna**")
@@ -1806,31 +1787,16 @@ def _render_dados_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFram
                     st.caption(
                         f"Comparação com a categórica irmã '{sibling}' -- as faixas têm que bater linha a "
                         f"linha com as categorias 'Média próxima ou igual a N' abaixo, e '(nulo)' aqui "
-                        f"corresponde à categoria 'N/A - ...' lá (são o mesmo grupo de gente, contado de "
-                        f"dois jeitos diferentes). Se não bater, é sinal de inconsistência -- foi assim "
-                        f"que o problema do ISDE apareceu."
+                        f"corresponde à categoria 'N/A - ...' lá. Se não bater, é sinal de inconsistência."
                     )
                     st.dataframe(_categorical_counts(base[sibling]).rename(sibling).to_frame(), width='stretch')
             elif m is not None and m.var_type in (VarType.SR, VarType.MR_OPTION, VarType.INDICATOR):
                 st.dataframe(_categorical_counts(base[col]).rename("contagem").to_frame(), width='stretch')
             else:
-                st.caption("Coluna numérica sem indicador associado -- sem faixa aqui, só o describe() acima.")
-
-    st.markdown("**Linhas duplicadas** (considerando só as colunas escolhidas acima)")
-    st.write(f"{int(subset.duplicated().sum())} de {len(subset)} linhas")
-    st.caption("Poucas colunas categóricas naturalmente geram muita 'duplicata' -- isso não é bug sozinho, é combinação de categoria se repetindo. Só desconfie se escolher colunas suficientes pra cada linha ser praticamente única (ex.: incluindo um ID).")
+                st.caption("Coluna numérica sem indicador associado -- sem faixa aqui, só o describe() abaixo.")
 
     st.markdown("**describe()**")
     st.dataframe(subset.describe(include="all").T, width='stretch')
-
-
-    with st.expander("Ver linhas cruas (opcional)"):
-        n_linhas = st.number_input(
-            "Quantas linhas mostrar",
-            min_value=1, max_value=max(1, min(len(base), 5000)), value=max(1, min(100, len(base))), step=50,
-            help="Limitado de propósito -- mostrar as 100k+ linhas de uma vez pode estourar a memória do app.",
-        )
-        st.dataframe(subset.head(int(n_linhas)), width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2212,9 +2178,6 @@ _SQL_APLICADA = "sql_aplicada"
 _SQL_TEXTO = "sql_texto"
 _SQL_ERRO = "sql_erro"
 _SQL_ERRO_DETALHE = "sql_erro_detalhe"
-_SQL_COLUNAS = "sql_colunas"
-_SQL_COLUNAS_PADRAO = ("ID_UNICO", "ANO", "OPERACAO", "CIDADES")
-SQL_LINHAS_MAX = 1000  # decisão do Ro (25/11): de 1 a 1.000 linhas na tabela da aba, pra página não pesar
 
 _SQL_EXEMPLOS = [
     ("Operação e anos", "OPERACAO = 'PLENA' AND ANO IN ('2024', '2025')"),
@@ -2248,10 +2211,6 @@ def _sql_mask_cached(data_path: str, condicao: str, colunas_ocultas: tuple, _dat
     return calcular_mascara(_data, condicao, colunas_ocultas)
 
 
-def _colunas_tabela_padrao(data: pd.DataFrame) -> list[str]:
-    return [c for c in _SQL_COLUNAS_PADRAO if c in data.columns]
-
-
 def _on_aplicar_sql(data: pd.DataFrame, meta: dict) -> None:
     """
     Callback do botão Aplicar. Só troca a condição aplicada se ela rodou
@@ -2280,12 +2239,6 @@ def _on_aplicar_sql(data: pd.DataFrame, meta: dict) -> None:
         return
     st.session_state[_SQL_APLICADA] = cond
     st.session_state[_SQL_ERRO] = None
-    # já mostra na tabela da aba as colunas que a condição usa
-    colunas = list(st.session_state.get(_SQL_COLUNAS) or _colunas_tabela_padrao(data))
-    for c in colunas_citadas(cond, list(data.columns)):
-        if c not in colunas and c not in ocultas:
-            colunas.append(c)
-    st.session_state[_SQL_COLUNAS] = colunas
 
 
 def _on_limpar_sql() -> None:
@@ -2328,7 +2281,7 @@ def _render_aviso_sql(cond: str, n: int, total: int) -> None:
     col_txt, col_btn = st.columns([5, 1], vertical_alignment="center")
     with col_txt:
         st.info(f"🔎 **Filtro SQL ativo** — {_fmt_int(n)} de {_fmt_int(total)} entrevistas. Vale pro app inteiro "
-                f"(aba 🔎 Filtro SQL); os filtros da barra lateral partem delas.")
+                f"(aba 🔎 Banco); os filtros da barra lateral partem delas.")
         st.code(cond, language="sql", wrap_lines=True)
     with col_btn:
         st.button("Limpar filtro SQL", key="sql_limpar_topo", on_click=_on_limpar_sql, width="stretch")
@@ -2371,11 +2324,12 @@ def _tabela_busca_codigos(data: pd.DataFrame, meta: dict, busca: str, ocultas: t
 
 def _render_sql_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame, sql_mask) -> None:
     """
-    Aba Filtro SQL: escrever a condição, achar o código da pergunta e ver a
-    tabela. Decisões do Ro (25/11): é pra quem já sabe SQL (sem montador
-    visual), mas erro em português; tabela com colunas escolhidas e de 1 a
-    1.000 linhas; escolher se a tabela mostra a base final ou só o SQL.
-    Com a caixa vazia, o app funciona como antes.
+    Parte 1 da aba 🔎 Banco: escrever a condição e achar o código da
+    pergunta. O que a condição deixou na base aparece logo abaixo, na
+    visão da base (`_render_base_atual`).
+    Decisões do Ro: é pra quem já sabe SQL (sem montador visual), mas erro
+    em português (25/11); sem tabela de "primeiras N linhas" (26/11: não
+    acha problema nenhum). Com a caixa vazia, o app funciona como antes.
     """
     st.subheader("Filtro SQL")
     st.caption(
@@ -2429,41 +2383,167 @@ def _render_sql_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame,
             st.dataframe(tabela, hide_index=True, width="stretch",
                          column_config={"pergunta": st.column_config.TextColumn(width="large")})
 
-    st.markdown("**Tabela**")
-    base_final = st.checkbox(
-        "Somar os filtros da barra lateral (base final, a que o cruzamento usa)", value=True, key="sql_base_final",
-        help="Só muda o que ESTA tabela mostra. O app usa sempre o filtro SQL e os da barra lateral juntos.",
-    )
-    if base_final:
-        base = filtered_data
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  VISÃO DA BASE (aba 🔎 Banco, parte 2)
+# ══════════════════════════════════════════════════════════════════════
+# "O front do banco" (Ro, 27/11): depois do recorte (SQL + barra lateral),
+# ver QUEM sobrou -- onde está (contagem por ano, operação, cidade...),
+# quais são (as linhas, com as colunas escolhidas) e o resumo dessas
+# colunas. A contagem é de ENTREVISTAS, sem peso: aqui é pra enxergar o
+# banco, não pra estimar -- por isso não bate com o % do banner, e não
+# deve bater.
+# O diagnóstico do banco (`diagnostico.py`) saiu do app em 27/11: achar
+# erro no banco é trabalho do ETL e vai rodar fora do app principal.
+
+_COLUNAS_ONDE = ["ANO", "OPERACAO", "CIDADES"]
+_COLUNAS_CONTEXTO = ["ID_UNICO", "ANO", "OPERACAO", "CIDADES"]
+_MAX_LINHAS_TELA = 2000   # na tela; o CSV leva todas
+_TOP_ONDE = 15            # valores por tabela de contagem
+_MAX_CONTAR_POR = 6
+_BASE_COLUNAS = "base_colunas"
+_BASE_AUTO = "_base_colunas_auto"  # colunas automáticas da execução anterior
+
+
+def _colunas_da_chave(key: str, data: pd.DataFrame, meta: dict) -> list[str]:
+    """
+    Colunas do banco por trás de uma chave do app. SR/indicador = a própria
+    coluna; bloco de múltipla escolha (ex.: P2.2a) não é coluna -- são as
+    colunas das opções, uma por opção.
+    """
+    if key in data.columns:
+        return [key]
+    if key in meta and meta[key].name in data.columns:
+        return [meta[key].name]
+    return [m.name for m in meta.values()
+            if m.var_type == VarType.MR_OPTION and m.mr_group == key and m.name in data.columns]
+
+
+def _colunas_automaticas(data: pd.DataFrame, meta: dict, active_filters: dict,
+                         stub_key: str | None, banner_keys: list[str]) -> list[str]:
+    """
+    As colunas que já vêm na visão: identificação (ID_UNICO, ANO, OPERACAO,
+    CIDADES) + as que a condição SQL usa + as dos filtros da barra lateral
+    + stub + banner. É o que explica por que cada entrevista está na base.
+    """
+    cols = list(_COLUNAS_CONTEXTO)
+    sql = active_filters.get(SQL_FILTER_KEY)
+    if sql:
+        cols += colunas_citadas(sql[0], list(data.columns))
+    for key in active_filters:
+        if key != SQL_FILTER_KEY:
+            cols += _colunas_da_chave(key, data, meta)
+    for key in [stub_key, *banner_keys]:
+        if key:
+            cols += _colunas_da_chave(key, data, meta)
+    return [c for c in dict.fromkeys(cols) if c in data.columns]
+
+
+def _sincronizar_colunas(auto: list[str]) -> None:
+    """
+    Mantém a seleção de colunas em dia com stub/banner/filtros sem apagar
+    o que o usuário mexeu: coluna automática NOVA entra, automática que
+    deixou de ser (trocou o stub, tirou um filtro) sai, e o resto -- o que
+    ele adicionou ou tirou à mão -- fica como está. Precisa rodar ANTES de
+    desenhar o widget: é o único momento em que o Streamlit deixa escrever
+    na chave dele.
+    """
+    antes = st.session_state.get(_BASE_AUTO)
+    atual = st.session_state.get(_BASE_COLUNAS)
+    if atual is None or antes is None:
+        st.session_state[_BASE_COLUNAS] = list(auto)
     else:
-        base = data[sql_mask] if sql_mask is not None else data
-    opcoes = [c for c in data.columns if c not in ocultas]
-    if _SQL_COLUNAS not in st.session_state:
-        st.session_state[_SQL_COLUNAS] = _colunas_tabela_padrao(data)
-    else:  # coluna que saiu do banco (troca de banco com o app aberto) derrubaria o multiselect
-        st.session_state[_SQL_COLUNAS] = [c for c in st.session_state[_SQL_COLUNAS] if c in opcoes]
-    label_por_coluna = {c: (meta[c].label if c in meta else c) for c in opcoes}
-    col_cols, col_n = st.columns([4, 1])
-    with col_cols:
-        colunas = st.multiselect(
-            "Colunas", options=opcoes, key=_SQL_COLUNAS,
-            format_func=lambda c: f"{c} — {label_por_coluna[c]}" if label_por_coluna[c] != c else c,
-            help="Digite pra buscar por código ou pelo texto da pergunta.",
+        sairam = set(antes) - set(auto)
+        entraram = [c for c in auto if c not in antes and c not in atual]
+        st.session_state[_BASE_COLUNAS] = [c for c in atual if c not in sairam] + entraram
+    st.session_state[_BASE_AUTO] = list(auto)
+
+
+def _render_contagens(base: pd.DataFrame, por: list[str]) -> None:
+    """ONDE ESTÁ: uma tabelinha de contagem por variável, três por linha."""
+    for i in range(0, len(por), 3):
+        for col, c in zip(st.columns(3), por[i:i + 3]):
+            with col:
+                serie = base[c].astype("string").fillna("(vazio)")
+                cont = serie.value_counts().head(_TOP_ONDE).rename("entrevistas").rename_axis(c)
+                st.dataframe(cont.to_frame(), width="stretch")
+                k = serie.nunique()
+                if k > _TOP_ONDE:
+                    st.caption(f"{_fmt_int(k)} valores diferentes; aqui os {_TOP_ONDE} maiores.")
+
+
+def _render_base_atual(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame, active_filters: dict,
+                       stub_key: str | None, banner_keys: list[str], na_handling: str) -> None:
+    """
+    A base que está valendo no app (SQL + barra lateral): quantas
+    entrevistas, onde estão, quais são e o resumo das colunas escolhidas.
+    Pra investigar um número estranho visto em outra aba sem sair do
+    recorte que gerou esse número.
+    """
+    st.subheader("A base agora")
+    filtros = _filter_note_lines(active_filters, meta, max_valores=5)
+    st.caption("  \n".join(filtros) if filtros else "Sem filtro: é o banco inteiro.")
+
+    base = filtered_data
+    if stub_key:
+        so_stub = st.toggle(
+            f"Só quem entrou no cruzamento (respondeu o stub {stub_key})", key="base_so_stub",
+            help="O banner só conta quem respondeu o stub. Ligado, o número bate com o 'Base Amostra NA' da coluna "
+                 "Total -- menos em stub de múltipla escolha, onde o NA soma menções e aqui são pessoas.",
         )
-    with col_n:
-        n_linhas = st.number_input("Linhas", min_value=1, max_value=SQL_LINHAS_MAX, value=SQL_LINHAS_MAX, step=50, key="sql_n_linhas")
-    if not colunas:
-        st.info("Escolha ao menos uma coluna.")
+        if so_stub:
+            base = filtered_data.loc[eligible_respondents(filtered_data, meta, stub_key, na_handling)]
+    n = len(base)
+    st.markdown(f"**{_fmt_int(n)}** de {_fmt_int(len(data))} entrevistas (contagem sem peso).")
+    if n == 0:
+        st.info("Nenhuma entrevista nesse recorte.")
         return
-    st.caption(f"Mostrando {_fmt_int(min(int(n_linhas), len(base)))} de {_fmt_int(len(base))} entrevistas "
-               f"({'base final' if base_final else 'só o filtro SQL'}). Passe o mouse no nome da coluna pra ver a pergunta.")
-    st.dataframe(
-        base[colunas].head(int(n_linhas)),
-        hide_index=True,
-        width="stretch",
-        column_config={c: st.column_config.Column(c, help=label_por_coluna[c]) for c in colunas},
+
+    rotulos = {c: meta[c].label for c in data.columns if c in meta}
+
+    def _nome(c: str) -> str:
+        r = rotulos.get(c, c)
+        return f"{c} — {r}" if r != c else c
+
+    por = st.multiselect(
+        "Contar por", options=list(data.columns), key="base_onde", format_func=_nome,
+        default=[c for c in _COLUNAS_ONDE if c in data.columns], max_selections=_MAX_CONTAR_POR,
+        help="Onde estão as entrevistas: tudo num ano só, numa cidade ou numa operação já aponta a causa.",
     )
+    _render_contagens(base, por)
+
+    _sincronizar_colunas(_colunas_automaticas(data, meta, active_filters, stub_key, banner_keys))
+    colunas = st.multiselect(
+        "Colunas", options=list(data.columns), key=_BASE_COLUNAS, format_func=_nome,
+        help="Já vêm a identificação, as colunas do SQL, dos filtros da barra lateral, do stub e do banner. "
+             "Adicione ou tire à vontade; ao trocar stub, banner ou filtro, as colunas deles entram sozinhas.",
+    )
+    if not colunas:
+        st.caption("Escolha ao menos uma coluna pra ver as linhas ou o resumo.")
+        return
+
+    if st.toggle("Ver as linhas", key="base_ver_linhas"):
+        linhas = base[colunas]
+        st.dataframe(linhas.head(_MAX_LINHAS_TELA), hide_index=True, width="stretch", placeholder="—")
+        if n > _MAX_LINHAS_TELA:
+            st.caption(f"Mostrando {_fmt_int(_MAX_LINHAS_TELA)}; o CSV leva as {_fmt_int(n)}.")
+        st.download_button("Baixar essas linhas (CSV)", linhas.to_csv(index=False).encode("utf-8"),
+                           file_name="base_atual.csv", mime="text/csv", key="base_csv")
+    if st.toggle("Resumo das colunas (nulos, distribuição, describe)", key="base_resumo"):
+        _render_resumo_colunas(base, meta, colunas)
+
+
+def _render_banco_tab(data: pd.DataFrame, meta: dict, filtered_data: pd.DataFrame, sql_mask, active_filters: dict,
+                      stub_key: str | None, banner_keys: list[str], na_handling: str) -> None:
+    """
+    Aba 🔎 Banco (27/11): filtro complexo em cima, o banco por dentro
+    embaixo. Era a aba Dados (filtro SQL + diagnóstico); o diagnóstico
+    saiu do app.
+    """
+    _render_sql_tab(data, meta, filtered_data, sql_mask)
+    st.divider()
+    _render_base_atual(data, meta, filtered_data, active_filters, stub_key, banner_keys, na_handling)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2497,7 +2577,7 @@ def _render_sidebar(
     recorte de linhas do df. Nada em `crosstab_engine.py` precisa saber
     que um filtro existe; ele só vê um df menor.
 
-    Filtro SQL (aba Filtro SQL): quando existe, `sql_base` é o banco já
+    Filtro SQL (aba Banco): quando existe, `sql_base` é o banco já
     cortado por ele e a cascata parte dali -- o SQL é o primeiro filtro.
     Ele entra em `active_filters` com a chave reservada `SQL_FILTER_KEY`,
     e por isso vale em tudo que já usa `active_filters`: a assinatura do
@@ -2508,7 +2588,7 @@ def _render_sidebar(
         st.header("1. Filtro de base (opcional)")
         if sql_condition:
             st.caption(f"🔎 **Filtro SQL ativo**: {_fmt_int(len(sql_base))} de {_fmt_int(len(data))} entrevistas "
-                       f"(aba 🔎 Filtro SQL). Os filtros abaixo partem delas.")
+                       f"(aba 🔎 Banco). Os filtros abaixo partem delas.")
             st.button("Limpar filtro SQL", key="sql_limpar_lateral", on_click=_on_limpar_sql)
         filter_keys = st.multiselect(
             "Restringir a base a...",
@@ -2729,15 +2809,13 @@ def main() -> None:
     if not banner_keys:
         st.warning("Selecione ao menos uma variável de banner na barra lateral (aba Cruzamento).")
 
-    # "Filtro SQL" é a ÚLTIMA aba de propósito: o Streamlit abre na primeira,
-    # então o app continua abrindo no Cruzamento, como antes.
+    # "Banco" (filtro SQL + visão da base) é a ÚLTIMA de
+    # propósito: o Streamlit abre na primeira, então o app abre no Cruzamento.
     # `key` fixa a identidade das abas: sem ele, o aviso do filtro SQL que
     # aparece/some ACIMA das abas mudava a posição delas na página, e o
     # Streamlit voltava pra primeira aba a cada Aplicar/Limpar (visto no teste).
-    # Diagnóstico é a ÚLTIMA (decisão do Ro, 25/11): é a aba de olhar o dado
-    # cru, não de análise. Estatística fica junto das abas de análise.
-    tab_cruzamento, tab_comparacao, tab_indices, tab_estatistica, tab_sql, tab_dados = st.tabs(
-        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "📐 Estatística", "🔎 Filtro SQL", "🩺 Diagnóstico de dados"],
+    tab_cruzamento, tab_comparacao, tab_indices, tab_estatistica, tab_banco = st.tabs(
+        ["📊 Cruzamento", "🔀 Comparar", "📈 Índices", "📐 Estatística", "🔎 Banco: filtro e visão"],
         key="abas_principais",
     )
     with tab_cruzamento:
@@ -2749,10 +2827,8 @@ def main() -> None:
                             use_weighting, small_n_threshold)
     with tab_estatistica:
         _render_estatistica_tab(data, meta, visible_options, filtered_data, use_weighting, active_filters)
-    with tab_sql:
-        _render_sql_tab(data, meta, filtered_data, sql_mask)
-    with tab_dados:
-        _render_dados_tab(data, meta, filtered_data)
+    with tab_banco:
+        _render_banco_tab(data, meta, filtered_data, sql_mask, active_filters, stub_key, banner_keys, na_handling)
 
 
 if __name__ == "__main__":
